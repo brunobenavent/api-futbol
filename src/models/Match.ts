@@ -6,7 +6,6 @@ export interface IMatch extends Document {
   homeScore: number | null;
   awayScore: number | null;
   matchDate: Date | null;
-  // ESTADOS SOPORTADOS
   status: 'SCHEDULED' | 'LIVE' | 'FINISHED' | 'POSTPONED' | 'SUSPENDED';
   season: string;
   round: number;

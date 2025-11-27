@@ -20,7 +20,7 @@ export class ScraperService {
     const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 
     return await (puppeteer as any).launch({ 
-      headless: 'new', // Invisible
+      headless: 'new', // Modo fantasma (invisible)
       executablePath: executablePath,
       ignoreHTTPSErrors: true, 
       defaultViewport: null,
@@ -60,7 +60,7 @@ export class ScraperService {
 
   // --- SCRAPEO PROFUNDO (Detalle + Marcador + Estado) ---
   public async scrapeMatchDetail(matchUrl: string) {
-    console.log(`🔍 Analizando DETALLE COMPLETO: ${matchUrl}`);
+    console.log(`🔍 Analizando DETALLE: ${matchUrl}`);
     const browser = await this.launchBrowser();
 
     try {
@@ -100,17 +100,15 @@ export class ScraperService {
                 else if (txt.includes("SUSP")) computedStatus = 'SUSPENDED';
             }
 
-            // 3. MARCADOR (Lectura directa)
+            // 3. MARCADOR
             let homeScore = null;
             let awayScore = null;
             const markers = document.querySelectorAll('.resultado .marker_box');
             if (markers.length >= 2) {
-                const s1 = markers[0].textContent?.trim();
-                const s2 = markers[1].textContent?.trim();
-                if (s1 && s2 && !isNaN(parseInt(s1)) && !isNaN(parseInt(s2))) {
-                    homeScore = parseInt(s1);
-                    awayScore = parseInt(s2);
-                    if (computedStatus === 'SCHEDULED') computedStatus = 'FINISHED'; 
+                homeScore = parseInt(markers[0].textContent?.trim() || "");
+                awayScore = parseInt(markers[1].textContent?.trim() || "");
+                if (!isNaN(homeScore) && !isNaN(awayScore) && computedStatus === 'SCHEDULED') {
+                    computedStatus = 'FINISHED';
                 }
             }
 
@@ -142,13 +140,11 @@ export class ScraperService {
                     }
                 }
             });
-
             return { stadium, currentMinute, events, homeScore, awayScore, computedStatus };
         });
 
         console.log(`📝 Detalles: Estadio="${details.stadium}", Marcador=${details.homeScore}-${details.awayScore}, Estado=${details.computedStatus}`);
 
-        // Objeto de actualización dinámico
         const updateData: any = { 
             stadium: details.stadium,
             currentMinute: details.currentMinute,
@@ -171,7 +167,7 @@ export class ScraperService {
     }
   }
 
-  // --- SCRAPEO GENERAL (Jornada) ---
+  // --- SCRAPEO GENERAL (Jornada) - VERSIÓN CORREGIDA PARA URLS ---
   public async scrapeRound(season: string, round: number) {
     const url = `https://www.resultados-futbol.com/competicion/primera/${season}/grupo1/jornada${round}`;
     console.log(`📡 Scrapeando: Temporada ${season} - Jornada ${round}`);
@@ -201,13 +197,19 @@ export class ScraperService {
             const homeSlug = homeLink ? homeLink.split('/')[2] : null;
             const awaySlug = awayLink ? awayLink.split('/')[2] : null;
             
-            // Logos
+            // --- CORRECCIÓN URL ESPECÍFICA ---
+            let specificUrl = row.querySelector('.rstd a')?.getAttribute('href');
+            if (!specificUrl) {
+                 specificUrl = `https://www.resultados-futbol.com/partido/${homeSlug}/${awaySlug}`;
+            } else if (!specificUrl.startsWith('http')) {
+                 specificUrl = `https://www.resultados-futbol.com${specificUrl}`;
+            }
+
             const homeImg = row.querySelector('.equipo1 img');
             const awayImg = row.querySelector('.equipo2 img');
             const homeLogo = homeImg?.getAttribute('data-src') || homeImg?.getAttribute('src') || null;
             const awayLogo = awayImg?.getAttribute('data-src') || awayImg?.getAttribute('src') || null;
 
-            // Fecha
             let rawDate = row.querySelector('.fecha')?.textContent?.trim() || "";
             let parsedDate = null;
             rawDate = rawDate.replace(/\s+/g, ' '); 
@@ -226,7 +228,6 @@ export class ScraperService {
                 }
             }
 
-            // Estado y Marcador
             let homeScore = null;
             let awayScore = null;
             let status = 'SCHEDULED';
@@ -259,7 +260,7 @@ export class ScraperService {
                 results.push({
                     homeTeam: homeSlug, awayTeam: awaySlug, homeScore, awayScore, status,
                     homeLogo, awayLogo,
-                    matchUrl: `https://www.resultados-futbol.com/partido/${homeSlug}/${awaySlug}`,
+                    matchUrl: specificUrl,
                     season, round, matchDate: parsedDate ? parsedDate : new Date().toISOString()
                 });
             }
@@ -268,8 +269,14 @@ export class ScraperService {
       }, season, round, startYear);
 
       console.log(`✅ Jornada ${round}: ${matchesData.length} partidos.`);
+      
       for (const m of matchesData) {
-        await Match.findOneAndUpdate({ matchUrl: m.matchUrl }, m, { upsert: true, new: true });
+        // CORRECCIÓN CRÍTICA: Buscar por Equipos y Temporada para actualizar la URL
+        await Match.findOneAndUpdate(
+            { homeTeam: m.homeTeam, awayTeam: m.awayTeam, season: m.season }, 
+            m, 
+            { upsert: true, new: true }
+        );
       }
     } catch (error) {
       console.error(`❌ Error en Jornada ${round}:`, error);

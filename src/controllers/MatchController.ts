@@ -28,7 +28,7 @@ export const seedSeason = async (req: Request, res: Response) => {
 export const hydrateRound = async (req: Request, res: Response) => {
   const { season, round } = req.params;
   try {
-    const roundNumber = parseInt(round); // <--- CORRECCIÓN CRÍTICA
+    const roundNumber = parseInt(round);
     const matches = await Match.find({ season, round: roundNumber });
 
     if (matches.length === 0) return res.status(404).send("No hay partidos.");

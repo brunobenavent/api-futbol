@@ -32,8 +32,6 @@ const checkMatchWindows = async () => {
         const fiveMinFromNow = new Date(now.getTime() + 5 * 60000);
         const twoHoursAgo = new Date(now.getTime() - 125 * 60000);
 
-        // BUSCAMOS PARTIDOS ACTIVOS
-        // Si es POSTPONED o SUSPENDED, lo ignoramos y no activamos el scraper
         const activeMatches = await Match.find({
             matchDate: { 
                 $lte: fiveMinFromNow, 
