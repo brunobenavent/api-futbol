@@ -17,13 +17,10 @@ export class ScraperService {
 
   // --- CONFIGURACIÓN CENTRALIZADA DEL NAVEGADOR ---
   private async launchBrowser() {
-    // En Railway (producción) usará la variable de entorno. En tu Mac, la ruta fija.
     const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 
-    return await (puppeteer as any).launch({
-      // 'new' = Invisible (Fantasma) | false = Visible
-      headless: 'new', 
-      
+    return await (puppeteer as any).launch({ 
+      headless: 'new', // Invisible
       executablePath: executablePath,
       ignoreHTTPSErrors: true, 
       defaultViewport: null,
@@ -31,14 +28,13 @@ export class ScraperService {
         '--no-sandbox', 
         '--disable-setuid-sandbox', 
         '--start-maximized',
-        '--disable-dev-shm-usage', // Vital para Docker/Railway
-        '--disable-features=IsolateOrigins,site-per-process',
-        '--blink-settings=imagesEnabled=false' // Bloqueo ligero de imágenes para velocidad
+        '--disable-dev-shm-usage',
+        '--disable-features=IsolateOrigins,site-per-process'
       ]
-    } as any);
+    });
   }
 
-  // --- ELIMINADOR DE POPUPS Y COOKIES ---
+  // --- ELIMINADOR DE POPUPS ---
   private async removeCookiesBruteForce(page: any) {
     try {
         await page.evaluate(() => {
@@ -62,9 +58,9 @@ export class ScraperService {
     await this.randomDelay(500, 1000);
   }
 
-  // --- SCRAPEO PROFUNDO (Detalle del Partido) ---
+  // --- SCRAPEO PROFUNDO (Detalle + Marcador + Estado) ---
   public async scrapeMatchDetail(matchUrl: string) {
-    console.log(`🔍 Analizando DETALLE: ${matchUrl}`);
+    console.log(`🔍 Analizando DETALLE COMPLETO: ${matchUrl}`);
     const browser = await this.launchBrowser();
 
     try {
@@ -77,26 +73,48 @@ export class ScraperService {
         
         await this.removeCookiesBruteForce(page);
         
-        // Scroll para cargar datos
         await page.evaluate(async () => {
             window.scrollBy(0, 500);
             await new Promise(r => setTimeout(r, 1000));
         });
 
         const details = await page.evaluate(() => {
-            // 1. ESTADIO (Búsqueda Global por texto)
+            // 1. ESTADIO
             let stadium = null;
             const stadiumEl = document.querySelector('li[itemprop="location"] span[itemprop="name"]');
             if (stadiumEl) {
                 stadium = stadiumEl.textContent?.replace('Estadio:', '').trim() || null;
             }
 
-            // 2. MINUTO ACTUAL
+            // 2. MINUTO / ESTADO
             let currentMinute = null;
             const minEl = document.querySelector('.live_min') || document.querySelector('.jor-status');
             if (minEl) currentMinute = minEl.textContent?.trim();
 
-            // 3. EVENTOS (Tabla Resumen)
+            let computedStatus = 'SCHEDULED';
+            if (currentMinute) {
+                const txt = currentMinute.toUpperCase();
+                if (txt.includes('FIN') || txt.includes('TERMINADO')) computedStatus = 'FINISHED';
+                else if (txt.includes("'") || txt.includes("DES")) computedStatus = 'LIVE';
+                else if (txt.includes("APLAZ")) computedStatus = 'POSTPONED';
+                else if (txt.includes("SUSP")) computedStatus = 'SUSPENDED';
+            }
+
+            // 3. MARCADOR (Lectura directa)
+            let homeScore = null;
+            let awayScore = null;
+            const markers = document.querySelectorAll('.resultado .marker_box');
+            if (markers.length >= 2) {
+                const s1 = markers[0].textContent?.trim();
+                const s2 = markers[1].textContent?.trim();
+                if (s1 && s2 && !isNaN(parseInt(s1)) && !isNaN(parseInt(s2))) {
+                    homeScore = parseInt(s1);
+                    awayScore = parseInt(s2);
+                    if (computedStatus === 'SCHEDULED') computedStatus = 'FINISHED'; 
+                }
+            }
+
+            // 4. EVENTOS (Goles)
             const events: any[] = [];
             const rows = document.querySelectorAll('.match-header-resume table tbody tr');
 
@@ -110,11 +128,11 @@ export class ScraperService {
                         let team = "";
                         const score = cells[3]?.textContent?.trim() || ""; 
 
-                        if (cells[2].classList.contains('gol')) { // Local
+                        if (cells[2].classList.contains('gol')) { 
                             team = 'home';
                             minute = cells[1].textContent?.trim() || "";
                             player = cells[0].textContent?.trim() || "Local";
-                        } else if (cells[4].classList.contains('gol')) { // Visitante
+                        } else if (cells[4].classList.contains('gol')) { 
                             team = 'away';
                             minute = cells[5].textContent?.trim() || "";
                             player = cells[6].textContent?.trim() || "Visitante";
@@ -124,18 +142,26 @@ export class ScraperService {
                     }
                 }
             });
-            return { stadium, currentMinute, events };
+
+            return { stadium, currentMinute, events, homeScore, awayScore, computedStatus };
         });
 
-        console.log(`📝 Detalles: Estadio="${details.stadium}", Goles=${details.events.length}`);
+        console.log(`📝 Detalles: Estadio="${details.stadium}", Marcador=${details.homeScore}-${details.awayScore}, Estado=${details.computedStatus}`);
+
+        // Objeto de actualización dinámico
+        const updateData: any = { 
+            stadium: details.stadium,
+            currentMinute: details.currentMinute,
+            events: details.events,
+        };
+
+        if (details.homeScore !== null) updateData.homeScore = details.homeScore;
+        if (details.awayScore !== null) updateData.awayScore = details.awayScore;
+        if (details.computedStatus !== 'SCHEDULED') updateData.status = details.computedStatus;
 
         await Match.findOneAndUpdate(
             { matchUrl: matchUrl },
-            { 
-                stadium: details.stadium,
-                currentMinute: details.currentMinute,
-                events: details.events
-            }
+            updateData
         );
 
     } catch (error) {
@@ -175,7 +201,7 @@ export class ScraperService {
             const homeSlug = homeLink ? homeLink.split('/')[2] : null;
             const awaySlug = awayLink ? awayLink.split('/')[2] : null;
             
-            // Logos (Soporte Lazy Load)
+            // Logos
             const homeImg = row.querySelector('.equipo1 img');
             const awayImg = row.querySelector('.equipo2 img');
             const homeLogo = homeImg?.getAttribute('data-src') || homeImg?.getAttribute('src') || null;
@@ -200,7 +226,7 @@ export class ScraperService {
                 }
             }
 
-            // --- LÓGICA DE ESTADO ---
+            // Estado y Marcador
             let homeScore = null;
             let awayScore = null;
             let status = 'SCHEDULED';
