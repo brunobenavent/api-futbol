@@ -1,10 +1,10 @@
 import mongoose, { Schema, Document } from 'mongoose';
 
 export interface ITeam extends Document {
-  name: string;        // "Real Madrid"
-  slug: string;        // "real-madrid" (Identificador único en la URL)
-  logo: string | null; // URL del escudo
-  stadium: string | null; // Estadio principal (opcional, por si queremos moverlo aquí)
+  name: string;
+  slug: string;
+  logo: string | null;
+  stadium: string | null;
 }
 
 const TeamSchema: Schema = new Schema({

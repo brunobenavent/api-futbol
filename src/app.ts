@@ -1,32 +1,35 @@
 import express, { Application } from 'express';
-import { triggerScrape, forceUpdateMatch } from './controllers/ScraperController.js';
-// Importamos el nuevo controlador hydrateRound
-import { getMatches, seedSeason, hydrateRound } from './controllers/MatchController.js'; 
+
+// Importamos los enrutadores
+import matchRoutes from './routes/matchRoutes.js';
+import teamRoutes from './routes/teamRoutes.js';
+import adminRoutes from './routes/adminRoutes.js';
+
+// --- IMPORTACIONES DE SWAGGER (ESTO TE FALTABA) ---
+import swaggerUi from 'swagger-ui-express'; 
+import { swaggerSpec } from './config/swagger.js'; 
 
 const app: Application = express();
 
 app.use(express.json());
 
+// Ruta Base
 app.get('/', (req, res) => {
   res.send('API de Fútbol Scraper funcionando ⚽️');
 });
 
-// --- RUTAS DE SCRAPING MANUAL ---
-// Scrapear la lista de partidos de una jornada (Rápido, sin detalles)
-app.get('/test-scrape/:season/:round', triggerScrape);
+// --- REGISTRO DE RUTAS ---
 
-// Hidratar un partido concreto por URL
-app.get('/api/hydrate-match', forceUpdateMatch); 
+// 1. Rutas de Partidos (Prefijo: /api/matches)
+app.use('/api/matches', matchRoutes);
 
-// NUEVO: Hidratar una jornada entera (lento, pero automático)
-app.get('/api/hydrate-round/:season/:round', hydrateRound);
+// 2. Rutas de Equipos (Prefijo: /api/teams)
+app.use('/api/teams', teamRoutes);
 
+// 3. Rutas de Admin/Scraping
+app.use('/', adminRoutes);
 
-// --- RUTAS DE DATOS ---
-// Ver partidos
-app.get('/api/matches', getMatches);
-
-// Cargar temporada completa (Seed)
-app.get('/api/seed/:season', seedSeason);
+// --- DOCUMENTACIÓN SWAGGER ---
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
 export default app;
