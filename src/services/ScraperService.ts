@@ -109,62 +109,95 @@ export class ScraperService {
     try {
         const pages = await browser.pages();
         const page = pages.length > 0 ? pages[0] : await browser.newPage();
-        
-        // INYECTAMOS LA EVASIÓN ANTES DE NAVEGAR
-        await this.injectEvasions(page);
-
-        const userAgent = new UserAgent({ deviceCategory: 'desktop', platform: 'Win32' }); // Forzamos Windows para coincidir con la GPU Intel
+        const userAgent = new UserAgent({ deviceCategory: 'desktop' });
         await page.setUserAgent(userAgent.toString());
 
         try { await page.goto(matchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }); } catch (e) {}
         
         await this.removeCookiesBruteForce(page);
+        
         await page.evaluate(async () => {
             window.scrollBy(0, 500);
             await new Promise(r => setTimeout(r, 1000));
         });
 
+        // --- 🛡️ GUARDIÁN DE COMPETICIÓN 🛡️ ---
+        // Verificamos si la web nos ha redirigido a otra competición (ej: Supercopa)
+        const competitionCheck = await page.evaluate(() => {
+            // Buscamos el texto del segundo enlace del menú de migas (crumbs)
+            // Estructura típica: Ligas > Primera División > Partido...
+            const crumb = document.querySelector('#crumbs li:nth-child(2) a')?.textContent?.trim();
+            return crumb || "";
+        });
+
+        // Si estamos en una competición que NO es Primera, abortamos y marcamos como Aplazado.
+        // (Ajusta "Primera División" si tu liga se llama diferente en la web)
+        if (competitionCheck && !competitionCheck.includes('Primera División')) {
+            console.warn(`⚠️ ALERTA: Redirección detectada a "${competitionCheck}". Este partido no es de Liga.`);
+            
+            // Forzamos estado APLAZADO y salimos para no guardar datos falsos
+            await Match.findOneAndUpdate(
+                { matchUrl: matchUrl },
+                { status: 'POSTPONED', stadium: null, homeScore: null, awayScore: null }
+            );
+            return; // <--- STOP AQUÍ
+        }
+
+        // --- SI PASA EL FILTRO, SEGUIMOS NORMAL ---
+
         const details = await page.evaluate(() => {
+            // 1. ESTADIO
             let stadium = null;
             const stadiumEl = document.querySelector('li[itemprop="location"] span[itemprop="name"]');
-            if (stadiumEl) stadium = stadiumEl.textContent?.replace('Estadio:', '').trim() || null;
+            if (stadiumEl) {
+                stadium = stadiumEl.textContent?.replace('Estadio:', '').trim() || null;
+            }
 
+            // 2. MINUTO / ESTADO
             let currentMinute = null;
             const minEl = document.querySelector('.live_min') || document.querySelector('.jor-status');
-            const rawStatusText = minEl?.textContent?.trim().toUpperCase() || "";
-            if (minEl) {
-                const txt = minEl.textContent?.trim() || "";
-                const match = txt.match(/\((.*?)\)/); 
-                if (match) currentMinute = match[1]; else currentMinute = txt;
-            }
+            if (minEl) currentMinute = minEl.textContent?.trim();
 
             let computedStatus = 'SCHEDULED';
-            if (rawStatusText) {
-                if (rawStatusText.includes('FIN') || rawStatusText.includes('TERMINADO')) computedStatus = 'FINISHED';
-                else if (rawStatusText.includes("'") || rawStatusText.includes("DES") || rawStatusText.includes("DIRECTO")) computedStatus = 'LIVE';
-                else if (rawStatusText.includes("APLAZ")) computedStatus = 'POSTPONED';
-                else if (rawStatusText.includes("SUSP")) computedStatus = 'SUSPENDED';
+            if (currentMinute) {
+                const txt = currentMinute.toUpperCase();
+                if (txt.includes('FIN') || txt.includes('TERMINADO')) computedStatus = 'FINISHED';
+                else if (txt.includes("'") || txt.includes("DES") || txt.includes("DIRECTO")) computedStatus = 'LIVE';
+                else if (txt.includes("APLAZ")) computedStatus = 'POSTPONED';
+                else if (txt.includes("SUSP")) computedStatus = 'SUSPENDED';
             }
 
+            // 3. MARCADOR
             let homeScore = null;
             let awayScore = null;
             const markers = document.querySelectorAll('.resultado .marker_box');
             if (markers.length >= 2) {
                 homeScore = parseInt(markers[0].textContent?.trim() || "");
                 awayScore = parseInt(markers[1].textContent?.trim() || "");
-                if (!isNaN(homeScore) && !isNaN(awayScore) && computedStatus === 'SCHEDULED') computedStatus = 'FINISHED'; 
+                if (!isNaN(homeScore) && !isNaN(awayScore) && computedStatus === 'SCHEDULED') {
+                    computedStatus = 'FINISHED'; 
+                }
             }
 
+            // 4. EVENTOS
             const events: any[] = [];
             const rows = document.querySelectorAll('.match-header-resume table tbody tr');
+
             rows.forEach(row => {
                 const goalIcon = row.querySelector('.mhr-ico.gol');
                 if (goalIcon) {
                     const cells = Array.from(row.querySelectorAll('td'));
                     if (cells.length >= 7) {
                         let minute = "", player = "", team = "", score = cells[3]?.textContent?.trim() || ""; 
-                        if (cells[2].classList.contains('gol')) { team = 'home'; minute = cells[1].textContent?.trim() || ""; player = cells[0].textContent?.trim() || "Local"; } 
-                        else if (cells[4].classList.contains('gol')) { team = 'away'; minute = cells[5].textContent?.trim() || ""; player = cells[6].textContent?.trim() || "Visitante"; }
+                        if (cells[2].classList.contains('gol')) { 
+                            team = 'home';
+                            minute = cells[1].textContent?.trim() || "";
+                            player = cells[0].textContent?.trim() || "Local";
+                        } else if (cells[4].classList.contains('gol')) { 
+                            team = 'away';
+                            minute = cells[5].textContent?.trim() || "";
+                            player = cells[6].textContent?.trim() || "Visitante";
+                        }
                         if (minute) events.push({ minute, player, score, team });
                     }
                 }
@@ -172,15 +205,26 @@ export class ScraperService {
             return { stadium, currentMinute, events, homeScore, awayScore, computedStatus };
         });
 
-        console.log(`📝 Detalles: Estadio="${details.stadium}", Marcador=${details.homeScore}-${details.awayScore}`);
-        
-        const updateData: any = { stadium: details.stadium, currentMinute: details.currentMinute, events: details.events };
+        console.log(`📝 Detalles: Estadio="${details.stadium}", Marcador=${details.homeScore}-${details.awayScore}, Estado=${details.computedStatus}`);
+
+        const updateData: any = { 
+            stadium: details.stadium,
+            currentMinute: details.currentMinute,
+            events: details.events,
+        };
+
         if (details.homeScore !== null) updateData.homeScore = details.homeScore;
         if (details.awayScore !== null) updateData.awayScore = details.awayScore;
+        
+        // Solo actualizamos estado si no estaba ya en POSTPONED por el guardián (aunque aquí ya habríamos salido)
         if (details.computedStatus !== 'SCHEDULED') updateData.status = details.computedStatus;
 
         const match = await Match.findOneAndUpdate({ matchUrl: matchUrl }, updateData, { new: true });
-        if (match && details.stadium) await Team.findByIdAndUpdate(match.homeTeam, { stadium: details.stadium });
+
+        // Solo actualizamos el estadio del equipo SI NO ES NULL (para no borrarlo si el partido falla)
+        if (match && details.stadium) {
+            await Team.findByIdAndUpdate(match.homeTeam, { stadium: details.stadium });
+        }
 
     } catch (error) {
         console.error("❌ Error en detalle:", error);
