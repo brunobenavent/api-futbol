@@ -17,22 +17,39 @@ export class ScraperService {
     return new Promise(resolve => setTimeout(resolve, delay));
   }
 
+  // --- CONFIGURACIÓN CENTRALIZADA DEL NAVEGADOR ---
   private async launchBrowser() {
+    // Detecta ruta automáticamente (Render vs Local)
     const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+
     return await (puppeteer as any).launch({ 
-      headless: 'new',
+      headless: 'new', // Modo invisible para producción
       executablePath: executablePath,
       ignoreHTTPSErrors: true, 
       defaultViewport: null,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--start-maximized', '--disable-dev-shm-usage', '--disable-features=IsolateOrigins,site-per-process']
+      args: [
+        '--no-sandbox', 
+        '--disable-setuid-sandbox', 
+        '--start-maximized',
+        '--disable-dev-shm-usage',
+        '--disable-features=IsolateOrigins,site-per-process'
+      ]
     });
   }
 
+  // --- ELIMINADOR DE POPUPS ---
   private async removeCookiesBruteForce(page: any) {
     try {
         await page.evaluate(() => {
-            const selectorList = ['#qc-cmp2-container', '.qc-cmp2-container', '#didomi-host', '.fc-consent-root', '.cookie-banner', '#login_rf', '.generic_dialog', '#betAgeConfirm2', '#betBlur'];
-            selectorList.forEach(sel => { const el = document.querySelector(sel); if (el) el.remove(); });
+            const selectorList = [
+                '#qc-cmp2-container', '.qc-cmp2-container', 
+                '#didomi-host', '.fc-consent-root', '.cookie-banner',
+                '#login_rf', '.generic_dialog', '#betAgeConfirm2', '#betBlur'
+            ];
+            selectorList.forEach(sel => { 
+                const el = document.querySelector(sel); 
+                if (el) el.remove(); 
+            });
             const buttons = Array.from(document.querySelectorAll('button, a.btn'));
             buttons.forEach((btn: any) => {
                 const t = btn.innerText?.toUpperCase();
@@ -44,10 +61,12 @@ export class ScraperService {
     await this.randomDelay(500, 1000);
   }
 
+  // --- HELPERS RELACIONALES ---
   private async getOrCreateSeason(year: string): Promise<any> {
     let season = await Season.findOne({ year });
     if (!season) {
         season = await Season.create({ year, name: `Temporada ${parseInt(year)-1}/${year}` });
+        console.log(`🆕 Temporada creada: ${year}`);
     }
     return season;
   }
@@ -63,7 +82,7 @@ export class ScraperService {
     return team;
   }
 
-  // --- SCRAPEO PROFUNDO (Protegido) ---
+  // --- SCRAPEO PROFUNDO (Detalle + Limpieza Estricta de Minuto) ---
   public async scrapeMatchDetail(matchUrl: string) {
     console.log(`🔍 Analizando DETALLE: ${matchUrl}`);
     const browser = await this.launchBrowser();
@@ -77,51 +96,79 @@ export class ScraperService {
         try { await page.goto(matchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }); } catch (e) {}
         
         await this.removeCookiesBruteForce(page);
+        
+        // Scroll para cargar datos
         await page.evaluate(async () => {
             window.scrollBy(0, 500);
             await new Promise(r => setTimeout(r, 1000));
         });
 
         const details = await page.evaluate(() => {
+            // 1. ESTADIO
             let stadium = null;
             const stadiumEl = document.querySelector('li[itemprop="location"] span[itemprop="name"]');
             if (stadiumEl) stadium = stadiumEl.textContent?.replace('Estadio:', '').trim() || null;
 
-            let currentMinute = null;
+            // 2. MINUTO / ESTADO (LÓGICA BLINDADA)
             const minEl = document.querySelector('.live_min') || document.querySelector('.jor-status');
-            const rawText = minEl?.textContent?.trim() || "";
+            let rawText = minEl?.textContent?.trim() || "";
             const upperText = rawText.toUpperCase();
 
             let computedStatus = 'SCHEDULED';
             let finalMinute = null;
 
+            // Detección de estado
             if (upperText.includes('FIN') || upperText.includes('TERMINADO')) {
                 computedStatus = 'FINISHED';
-            } else if (upperText.includes("'") || upperText.includes("DES") || upperText.includes("DIRECTO")) {
-                computedStatus = 'LIVE';
             } else if (upperText.includes("APLAZ")) {
                 computedStatus = 'POSTPONED';
             } else if (upperText.includes("SUSP")) {
                 computedStatus = 'SUSPENDED';
+            } 
+            // Detección de LIVE estricta
+            else if (upperText.includes("'") || upperText.includes("DES") || upperText.includes("DIRECTO")) {
+                computedStatus = 'LIVE';
             }
 
+            // Limpieza de minuto (Evitar textos largos basura)
             if (computedStatus === 'LIVE') {
-                const match = rawText.match(/\((.*?)\)/); 
-                if (match) finalMinute = match[1];
-                else finalMinute = rawText; 
+                // Si el texto es muy largo (basura), intentamos rescatar solo el patrón "XX'"
+                if (rawText.length > 15) {
+                     const cleanMatch = rawText.match(/(\d+\+?\d*')/); // Busca números + comilla
+                     if (cleanMatch) {
+                         finalMinute = cleanMatch[1]; 
+                     } else if (upperText.includes("DES")) {
+                         finalMinute = "DES";
+                     } else {
+                         // Si es largo y no tiene formato de minuto, probablemente no sea el minuto
+                         computedStatus = 'SCHEDULED'; 
+                         finalMinute = null;
+                     }
+                } else {
+                    // Texto corto (normal)
+                    const match = rawText.match(/\((.*?)\)/); // Saca (30') de DIRECTO (30')
+                    if (match) finalMinute = match[1];
+                    else finalMinute = rawText; // Ej: "DES" o "45'"
+                }
+            } else {
+                // Si no está LIVE, el minuto siempre es NULL (Limpia "HOY", "MAÑANA")
+                finalMinute = null;
             }
 
+            // 3. MARCADOR
             let homeScore = null;
             let awayScore = null;
             const markers = document.querySelectorAll('.resultado .marker_box');
             if (markers.length >= 2) {
                 homeScore = parseInt(markers[0].textContent?.trim() || "");
                 awayScore = parseInt(markers[1].textContent?.trim() || "");
+                // Si hay goles, aseguramos que no esté en SCHEDULED
                 if (!isNaN(homeScore) && !isNaN(awayScore) && computedStatus === 'SCHEDULED') {
                     computedStatus = 'FINISHED'; 
                 }
             }
 
+            // 4. EVENTOS (Goles)
             const events: any[] = [];
             const rows = document.querySelectorAll('.match-header-resume table tbody tr');
             rows.forEach(row => {
@@ -139,15 +186,16 @@ export class ScraperService {
                     }
                 }
             });
+
             return { stadium, currentMinute: finalMinute, events, homeScore, awayScore, computedStatus };
         });
 
-        // --- PROTECCIÓN ANTI-FLICKER DETALLE ---
+        // --- PROTECCIÓN ANTI-FLICKER ---
         const currentMatchInDB = await Match.findOne({ matchUrl: matchUrl }).select('status');
-        if (currentMatchInDB && (currentMatchInDB.status === 'LIVE' || currentMatchInDB.status === 'FINISHED')) {
+        if (currentMatchInDB && currentMatchInDB.status === 'LIVE') {
             if (details.computedStatus === 'SCHEDULED') {
-                console.log("🛡️ Protección Detalle: El scraper falló, mantenemos estado anterior.");
-                details.computedStatus = currentMatchInDB.status; // Mantenemos el estado real
+                console.log("🛡️ Protección: Mantenemos LIVE aunque falle el scraper.");
+                details.computedStatus = 'LIVE';
             }
         }
 
@@ -157,13 +205,16 @@ export class ScraperService {
             stadium: details.stadium,
             currentMinute: details.currentMinute,
             events: details.events,
-            status: details.computedStatus // Usamos el estado protegido
         };
+
         if (details.homeScore !== null) updateData.homeScore = details.homeScore;
         if (details.awayScore !== null) updateData.awayScore = details.awayScore;
+        if (details.computedStatus !== 'SCHEDULED') updateData.status = details.computedStatus;
 
         const match = await Match.findOneAndUpdate({ matchUrl: matchUrl }, updateData, { new: true });
-        if (match && details.stadium) await Team.findByIdAndUpdate(match.homeTeam, { stadium: details.stadium });
+        if (match && details.stadium) {
+            await Team.findByIdAndUpdate(match.homeTeam, { stadium: details.stadium });
+        }
 
     } catch (error) {
         console.error("❌ Error en detalle:", error);
@@ -172,7 +223,7 @@ export class ScraperService {
     }
   }
 
-  // --- SCRAPEO GENERAL (JORNADA) - CON PROTECCIÓN TOTAL ---
+  // --- SCRAPEO GENERAL (JORNADA) ---
   public async scrapeRound(seasonYear: string, round: number) {
     const url = `https://www.resultados-futbol.com/competicion/primera/${seasonYear}/grupo1/jornada${round}`;
     console.log(`📡 Scrapeando: Temporada ${seasonYear} - Jornada ${round}`);
@@ -216,6 +267,7 @@ export class ScraperService {
             if (homeLogo) homeLogo = homeLogo.split('?')[0];
             if (awayLogo) awayLogo = awayLogo.split('?')[0];
 
+            // Fecha Inteligente
             let rawDateText = row.querySelector('.fecha')?.textContent?.trim() || "";
             let statusText = row.querySelector('.rstd')?.textContent?.trim() || "";
             const cleanDateText = rawDateText.replace(/\s+/g, ' ').toUpperCase();
@@ -225,7 +277,7 @@ export class ScraperService {
             const timeStr = timeMatch ? timeMatch[1] : "00:00";
 
             let targetDate = new Date();
-            if (cleanDateText.includes("HOY")) { /* hoy */ } 
+            if (cleanDateText.includes("HOY")) { /* es hoy */ } 
             else if (cleanDateText.includes("MAÑANA")) { targetDate.setDate(targetDate.getDate() + 1); } 
             else if (cleanDateText.includes("AYER")) { targetDate.setDate(targetDate.getDate() - 1); } 
             else {
@@ -248,6 +300,7 @@ export class ScraperService {
             if (m >= 3 && m <= 9) offset = 2; 
             const finalDate = new Date(Date.UTC(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate(), hours - offset, minutes));
 
+            // Estado
             let homeScore = null;
             let awayScore = null;
             let status = 'SCHEDULED';
@@ -290,33 +343,16 @@ export class ScraperService {
             $addToSet: { teams: { $each: [homeTeamDoc._id, awayTeamDoc._id] } }
         });
 
-        // --- LÓGICA DE PROTECCIÓN ANTI-FLICKER JORNADA ---
-        const existingMatch = await Match.findOne({ 
-            season: seasonDoc._id, homeTeam: homeTeamDoc._id, awayTeam: awayTeamDoc._id 
-        });
-
-        // Si en la BD ya está LIVE o FINISHED, y el nuevo status es SCHEDULED (error), lo ignoramos
-        if (existingMatch && (existingMatch.status === 'LIVE' || existingMatch.status === 'FINISHED')) {
-            if (m.status === 'SCHEDULED') {
-                // console.log(`🛡️ Protección Jornada: ${m.homeName} vs ${m.awayName} se mantiene ${existingMatch.status}`);
-                m.status = existingMatch.status; // Forzamos el estado antiguo
-                // También mantenemos el resultado antiguo si el nuevo es null
-                if (m.homeScore === null) {
-                    m.homeScore = existingMatch.homeScore;
-                    m.awayScore = existingMatch.awayScore;
-                }
-            }
-        }
-
         const updateData: any = {
             season: seasonDoc._id, homeTeam: homeTeamDoc._id, awayTeam: awayTeamDoc._id,
-            round: m.round, matchUrl: m.matchUrl, status: m.status
+            round: m.round, matchUrl: m.matchUrl
         };
-        
         if (m.matchDate) updateData.matchDate = m.matchDate;
         if (m.homeScore !== null) updateData.homeScore = m.homeScore;
         if (m.awayScore !== null) updateData.awayScore = m.awayScore;
-        // Solo actualizamos minuto desde la jornada si es LIVE
+        if (m.status !== 'SCHEDULED') updateData.status = m.status;
+        
+        // Solo si es LIVE guardamos el minuto sucio (el detalle lo limpia luego)
         if (m.currentMinute && m.status === 'LIVE') updateData.currentMinute = m.currentMinute;
 
         await Match.findOneAndUpdate(
@@ -332,16 +368,22 @@ export class ScraperService {
     }
   }
 
+  // ... (scrapeFullSeason y updateLiveMatches siguen igual) ...
   public async scrapeFullSeason(season: string) {
     if (ScraperService.isSeeding) return;
     ScraperService.isSeeding = true; 
+    console.log(`🚀 Iniciando CARGA de la temporada ${season}...`);
     try {
         for (let i = 1; i <= 38; i++) {
             await this.scrapeRound(season, i);
             await new Promise(r => setTimeout(r, 2000));
         }
-    } catch (e) { console.error(e); } 
-    finally { ScraperService.isSeeding = false; }
+        console.log("🏁 CARGA COMPLETADA.");
+    } catch (e) {
+        console.error("Error en carga masiva:", e);
+    } finally {
+        ScraperService.isSeeding = false; 
+    }
   }
 
   public async updateLiveMatches() {
