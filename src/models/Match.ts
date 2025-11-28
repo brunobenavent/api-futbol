@@ -7,6 +7,7 @@ export interface IMatch extends Document {
   homeScore: number | null;
   awayScore: number | null;
   matchDate: Date | null;
+  // ESTADOS COMPLETOS
   status: 'SCHEDULED' | 'LIVE' | 'FINISHED' | 'POSTPONED' | 'SUSPENDED';
   round: number;
   matchUrl: string;
@@ -29,6 +30,7 @@ const MatchSchema: Schema = new Schema({
   matchDate: { type: Date, default: null },
   status: { 
     type: String, 
+    // IMPORTANTE: Lista completa de estados para que Mongo no rechace el guardado
     enum: ['SCHEDULED', 'LIVE', 'FINISHED', 'POSTPONED', 'SUSPENDED'], 
     default: 'SCHEDULED' 
   },

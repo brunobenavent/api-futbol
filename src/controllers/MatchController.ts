@@ -2,7 +2,7 @@ import { Request, Response } from 'express';
 import { ScraperService } from '../services/ScraperService.js';
 import Match from '../models/Match.js';
 import Season from '../models/Season.js';
-// Importamos Team para asegurar que Mongoose registra el modelo
+// Importamos Team para asegurar que Mongoose registra el modelo para el populate
 import '../models/Team.js';
 
 const scraper = new ScraperService();
@@ -77,7 +77,6 @@ export const getMatchesByRound = async (req: Request, res: Response) => {
 // --- NUEVO: CURRENT ROUND + PARTIDOS ---
 export const getCurrentRound = async (req: Request, res: Response) => {
   try {
-    // 1. Calculamos temporada automática
     const autoSeason = getAutoSeasonYear();
     const seasonYear = req.query.season ? String(req.query.season) : autoSeason;
 
@@ -86,14 +85,13 @@ export const getCurrentRound = async (req: Request, res: Response) => {
 
     const now = new Date();
 
-    // 2. Determinamos cuál es la jornada "activa"
-    // Buscamos el primer partido que no ha pasado todavía (o es hoy)
+    // Determinamos cuál es la jornada "activa"
     const nextMatch = await Match.findOne({
         season: seasonDoc._id,
         matchDate: { $gte: now } 
     }).sort({ matchDate: 1 }).select('round'); 
 
-    let targetRound = 38; // Por defecto fin de liga
+    let targetRound = 38;
     let status = 'FINISHED';
 
     if (nextMatch) {
@@ -101,19 +99,19 @@ export const getCurrentRound = async (req: Request, res: Response) => {
         status = 'ACTIVE';
     }
 
-    // 3. Obtenemos los partidos de esa jornada
+    // Obtenemos los partidos de esa jornada
     const matches = await Match.find({
         season: seasonDoc._id,
         round: targetRound
     })
-    .sort({ matchDate: 1 }) // Ordenados por hora
-    .populate('homeTeam awayTeam'); // Rellenamos nombres y escudos
+    .sort({ matchDate: 1 }) 
+    .populate('homeTeam awayTeam'); 
 
     res.json({ 
         season: seasonYear, 
         currentRound: targetRound, 
         status: status,
-        matches: matches // <--- Datos listos para el Frontend
+        matches: matches 
     });
 
   } catch (error) {
@@ -152,6 +150,7 @@ export const hydrateRound = async (req: Request, res: Response) => {
             const away = match.awayTeam as any;
             console.log(`>> Procesando: ${home.name} vs ${away.name}`);
             await scraper.scrapeMatchDetail(match.matchUrl);
+            // Pausa para evitar bloqueos
             await new Promise(r => setTimeout(r, 2000));
         }
         console.log(`✅ Hidratación completada.`);
@@ -171,7 +170,7 @@ export const syncStadiums = async (req: Request, res: Response) => {
           let count = 0;
           for (const match of matchesWithStadium) {
               if (match.homeTeam && match.stadium) {
-                  // Importamos Team explícitamente arriba, así que esto funciona
+                  // Importamos Team dinámicamente para asegurar el contexto o usamos la referencia de arriba si funciona
                   const TeamModel = (await import('../models/Team.js')).default;
                   await TeamModel.findByIdAndUpdate(match.homeTeam, { stadium: match.stadium });
                   count++;

@@ -10,23 +10,35 @@ const getRandomInterval = () => Math.floor(Math.random() * (120000 - 40000 + 1) 
 
 const runScrapingCycle = async () => {
     if (!isScrapingActive) return;
-    try { await scraper.updateLiveMatches(); } catch (e) { console.error(e); }
+
+    try {
+        await scraper.updateLiveMatches();
+    } catch (error) {
+        console.error("Error en ciclo de scraping:", error);
+    }
 
     if (isScrapingActive) {
         const nextDelay = getRandomInterval();
-        console.log(`⏱️ Próximo escaneo en ${Math.round(nextDelay / 1000)}s...`);
+        console.log(`⏱️ Próximo escaneo en ${Math.round(nextDelay / 1000)} segundos...`);
         scrapingTimeout = setTimeout(runScrapingCycle, nextDelay);
     }
 };
 
 const checkMatchWindows = async () => {
     if (ScraperService.isSeeding) return;
+
     try {
         const now = new Date();
+        // Ventana: Desde 2 horas antes hasta 5 min después del inicio
+        const fiveMinFromNow = new Date(now.getTime() + 5 * 60000);
+        const twoHoursAgo = new Date(now.getTime() - 125 * 60000);
+
+        // BUSCAMOS PARTIDOS ACTIVOS
+        // CLAVE: Ignoramos FINISHED, pero TAMBIÉN los POSTPONED y SUSPENDED
         const activeMatches = await Match.find({
             matchDate: { 
-                $lte: new Date(now.getTime() + 5 * 60000), 
-                $gte: new Date(now.getTime() - 125 * 60000) 
+                $lte: fiveMinFromNow, 
+                $gte: twoHoursAgo 
             },
             status: { $nin: ['FINISHED', 'POSTPONED', 'SUSPENDED'] }
         });
@@ -37,16 +49,23 @@ const checkMatchWindows = async () => {
             console.log(`🚨 ¡HORA DE PARTIDO! Hay ${activeMatches.length} partidos activos.`);
             isScrapingActive = true;
             runScrapingCycle();
-        } else if (!shouldScrape && isScrapingActive) {
-            console.log("zzZ Pausando scraping.");
+        }
+        else if (!shouldScrape && isScrapingActive) {
+            console.log("zzZ No hay partidos activos. Pausando.");
             isScrapingActive = false;
             if (scrapingTimeout) clearTimeout(scrapingTimeout);
         }
-    } catch (e) { console.error(e); }
+
+    } catch (error) {
+        console.error("Error chequeando ventanas:", error);
+    }
 };
 
 export const initJobs = () => {
     console.log("📅 Sistema de Cron Inteligente INICIADO.");
-    cron.schedule('* * * * *', () => checkMatchWindows());
+    // Chequeo cada minuto
+    cron.schedule('* * * * *', () => {
+        checkMatchWindows();
+    });
     checkMatchWindows();
 };
