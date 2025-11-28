@@ -22,7 +22,7 @@ export class ScraperService {
     const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 
     return await (puppeteer as any).launch({ 
-      headless: 'new', // Invisible
+      headless: 'new', // Invisible (Modo Producción)
       executablePath: executablePath,
       ignoreHTTPSErrors: true, 
       defaultViewport: null,
@@ -81,9 +81,9 @@ export class ScraperService {
     return team;
   }
 
-  // --- SCRAPEO PROFUNDO (Detalle + Marcador + Estado + Minuto Limpio) ---
+  // --- SCRAPEO PROFUNDO (Detalle + Marcador + Estado + Minuto Limpio + Anti-Flicker) ---
   public async scrapeMatchDetail(matchUrl: string) {
-    console.log(`🔍 Analizando DETALLE: ${matchUrl}`);
+    console.log(`🔍 Analizando DETALLE COMPLETO: ${matchUrl}`);
     const browser = await this.launchBrowser();
 
     try {
@@ -105,9 +105,11 @@ export class ScraperService {
             // 1. ESTADIO
             let stadium = null;
             const stadiumEl = document.querySelector('li[itemprop="location"] span[itemprop="name"]');
-            if (stadiumEl) stadium = stadiumEl.textContent?.replace('Estadio:', '').trim() || null;
+            if (stadiumEl) {
+                stadium = stadiumEl.textContent?.replace('Estadio:', '').trim() || null;
+            }
 
-            // 2. LÓGICA DE ESTADO Y MINUTO
+            // 2. LÓGICA DE ESTADO Y MINUTO (MEJORADA)
             const minEl = document.querySelector('.live_min') || document.querySelector('.jor-status');
             const rawText = minEl?.textContent?.trim() || "";
             const upperText = rawText.toUpperCase();
@@ -115,7 +117,7 @@ export class ScraperService {
             let computedStatus = 'SCHEDULED';
             let finalMinute = null;
 
-            // Estado
+            // Calculamos estado basado en el texto
             if (upperText.includes('FIN') || upperText.includes('TERMINADO')) {
                 computedStatus = 'FINISHED';
             } else if (upperText.includes("'") || upperText.includes("DES") || upperText.includes("DIRECTO")) {
@@ -126,12 +128,13 @@ export class ScraperService {
                 computedStatus = 'SUSPENDED';
             }
 
-            // Minuto (Solo si es LIVE)
+            // SOLO guardamos el minuto si está LIVE
             if (computedStatus === 'LIVE') {
+                // Si pone "DIRECTO (30')", sacamos el 30'
                 const match = rawText.match(/\((.*?)\)/); 
                 if (match) finalMinute = match[1];
-                else finalMinute = rawText; 
-            }
+                else finalMinute = rawText; // Ej: "DES"
+            } 
 
             // 3. MARCADOR
             let homeScore = null;
@@ -140,6 +143,7 @@ export class ScraperService {
             if (markers.length >= 2) {
                 homeScore = parseInt(markers[0].textContent?.trim() || "");
                 awayScore = parseInt(markers[1].textContent?.trim() || "");
+                // Si hay goles, aseguramos que no esté en SCHEDULED
                 if (!isNaN(homeScore) && !isNaN(awayScore) && computedStatus === 'SCHEDULED') {
                     computedStatus = 'FINISHED'; 
                 }
@@ -167,7 +171,17 @@ export class ScraperService {
             return { stadium, currentMinute: finalMinute, events, homeScore, awayScore, computedStatus };
         });
 
-        // 👇👇 AQUÍ ESTÁ EL CAMBIO: AÑADIDO EL MARCADOR AL LOG 👇👇
+        // --- LÓGICA DE PROTECCIÓN (ANTI-FLICKER) ---
+        const currentMatchInDB = await Match.findOne({ matchUrl: matchUrl }).select('status');
+        
+        if (currentMatchInDB && currentMatchInDB.status === 'LIVE') {
+            // Si en BD estaba LIVE, pero el scraper dice SCHEDULED (fallo momentáneo), mantenemos LIVE.
+            if (details.computedStatus === 'SCHEDULED') {
+                console.log("🛡️ Protección activada: El scraper no vio el tiempo, pero mantenemos LIVE.");
+                details.computedStatus = 'LIVE';
+            }
+        }
+
         console.log(`📝 Detalles: Estadio="${details.stadium}", Marcador=${details.homeScore}-${details.awayScore}, Minuto="${details.currentMinute}", Estado=${details.computedStatus}`);
 
         const updateData: any = { 
@@ -175,6 +189,7 @@ export class ScraperService {
             currentMinute: details.currentMinute,
             events: details.events,
         };
+
         if (details.homeScore !== null) updateData.homeScore = details.homeScore;
         if (details.awayScore !== null) updateData.awayScore = details.awayScore;
         if (details.computedStatus !== 'SCHEDULED') updateData.status = details.computedStatus;
@@ -191,7 +206,7 @@ export class ScraperService {
     }
   }
 
-  // --- SCRAPEO GENERAL (JORNADA) - CON AJUSTE HORARIO ---
+  // --- SCRAPEO GENERAL (Jornada) ---
   public async scrapeRound(seasonYear: string, round: number) {
     const url = `https://www.resultados-futbol.com/competicion/primera/${seasonYear}/grupo1/jornada${round}`;
     console.log(`📡 Scrapeando: Temporada ${seasonYear} - Jornada ${round}`);
@@ -235,58 +250,43 @@ export class ScraperService {
             if (homeLogo) homeLogo = homeLogo.split('?')[0];
             if (awayLogo) awayLogo = awayLogo.split('?')[0];
 
-            // --- PARSEO DE FECHA Y HORA (AJUSTE UTC) ---
+            // Fecha
             let rawDateText = row.querySelector('.fecha')?.textContent?.trim() || "";
             let statusText = row.querySelector('.rstd')?.textContent?.trim() || "";
-            
             const cleanDateText = rawDateText.replace(/\s+/g, ' ').toUpperCase();
             const cleanStatusText = statusText.replace(/\s+/g, ' ').toUpperCase();
 
-            // 1. Buscar la hora (21:00)
             const timeMatch = cleanDateText.match(/(\d{1,2}:\d{2})/) || cleanStatusText.match(/(\d{1,2}:\d{2})/);
             const timeStr = timeMatch ? timeMatch[1] : "00:00";
 
-            // 2. Determinar Día/Mes/Año
-            // Creamos la fecha directamente en UTC para evitar líos con la hora local del servidor
-            let year = startYear;
-            let monthIndex = 0;
-            let day = 1;
-            let dateFound = false;
-
-            const dateRegexMatch = rawDateText.match(/(\d{1,2})\s([A-Z][a-z]{2})/);
-            if (dateRegexMatch) {
-                day = parseInt(dateRegexMatch[1]);
-                const monthStr = dateRegexMatch[2];
-                monthIndex = monthMap[monthStr] !== undefined ? monthMap[monthStr] : -1;
-                if (monthIndex !== -1) {
-                    // Ajuste de año
-                    if (monthIndex < 6) year = parseInt(seasonYear);
-                    dateFound = true;
+            let targetDate = new Date();
+            if (cleanDateText.includes("HOY")) { /* es hoy */ } 
+            else if (cleanDateText.includes("MAÑANA")) { targetDate.setDate(targetDate.getDate() + 1); } 
+            else if (cleanDateText.includes("AYER")) { targetDate.setDate(targetDate.getDate() - 1); } 
+            else {
+                const dateRegexMatch = rawDateText.match(/(\d{1,2})\s([A-Z][a-z]{2})/);
+                if (dateRegexMatch) {
+                    const day = parseInt(dateRegexMatch[1]);
+                    const monthStr = dateRegexMatch[2];
+                    const monthIndex = monthMap[monthStr] !== undefined ? monthMap[monthStr] : -1;
+                    if (monthIndex !== -1) {
+                        let year = startYear;
+                        if (monthIndex < 6) year = parseInt(seasonYear);
+                        targetDate = new Date(year, monthIndex, day);
+                    }
                 }
             }
 
-            // Si la fecha es relativa (HOY/MAÑANA), usamos la fecha actual como base
-            if (!dateFound || cleanDateText.includes("HOY") || cleanDateText.includes("MAÑANA")) {
-                const now = new Date();
-                year = now.getFullYear();
-                monthIndex = now.getMonth();
-                day = now.getDate();
-                if (cleanDateText.includes("MAÑANA")) day += 1;
-                if (cleanDateText.includes("AYER")) day -= 1;
-            }
-
             const [hours, minutes] = timeStr.split(':').map(Number);
+            // Ajuste UTC básico para España (Invierno UTC+1) -> Restar 1h
+            // Si estamos en verano (UTC+2) -> Restar 2h (Abril-Oct)
+            let offset = 1;
+            const m = targetDate.getMonth();
+            if (m >= 3 && m <= 9) offset = 2;
+            
+            const finalDate = new Date(Date.UTC(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate(), hours - offset, minutes));
 
-            // 3. Construir fecha en UTC con offset de España
-            // España es UTC+1 en invierno, UTC+2 en verano.
-            // Si restamos ese offset a la hora leída, obtenemos la hora UTC real para Mongo.
-            let offset = 1; // Invierno
-            if (monthIndex >= 3 && monthIndex <= 9) offset = 2; // Verano (Abril-Oct) aprox
-
-            // Date.UTC crea un timestamp. Al hacer new Date(timestamp), tenemos la fecha absoluta.
-            const finalDate = new Date(Date.UTC(year, monthIndex, day, hours - offset, minutes));
-
-            // --- ESTADO ---
+            // Estado
             let homeScore = null;
             let awayScore = null;
             let status = 'SCHEDULED';
@@ -311,9 +311,8 @@ export class ScraperService {
                 results.push({
                     homeName, awayName, homeSlug, awaySlug, homeLogo, awayLogo,
                     homeScore, awayScore, status, matchUrl: specificUrl,
-                    round, 
-                    matchDate: finalDate.toISOString(), // <--- FECHA CORREGIDA
-                    currentMinute: cleanStatusText
+                    round, matchDate: finalDate.toISOString(),
+                    currentMinute: cleanStatusText 
                 });
             }
         });
@@ -332,14 +331,17 @@ export class ScraperService {
 
         const updateData: any = {
             season: seasonDoc._id, homeTeam: homeTeamDoc._id, awayTeam: awayTeamDoc._id,
-            homeScore: m.homeScore, awayScore: m.awayScore, status: m.status,
-            matchDate: m.matchDate, round: m.round, matchUrl: m.matchUrl,
+            round: m.round, matchUrl: m.matchUrl
         };
+        if (m.matchDate) updateData.matchDate = m.matchDate;
+        if (m.homeScore !== null) updateData.homeScore = m.homeScore;
+        if (m.awayScore !== null) updateData.awayScore = m.awayScore;
+        if (m.status !== 'SCHEDULED') updateData.status = m.status;
         if (m.currentMinute && m.status === 'LIVE') updateData.currentMinute = m.currentMinute;
 
         await Match.findOneAndUpdate(
             { season: seasonDoc._id, homeTeam: homeTeamDoc._id, awayTeam: awayTeamDoc._id }, 
-            updateData, 
+            { $set: updateData }, 
             { upsert: true, new: true }
         );
       }
