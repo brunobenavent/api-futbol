@@ -56,12 +56,24 @@ const swaggerDefinition = {
     },
     '/api/matches/current-round': {
       get: {
-        summary: 'Obtener jornada actual',
+        summary: 'Obtener jornada actual y partidos',
         tags: ['Matches'],
         responses: {
           200: {
             description: 'Info de jornada',
-            content: { 'application/json': { schema: { type: 'object' } } }
+            content: { 
+                'application/json': { 
+                    schema: { 
+                        type: 'object',
+                        properties: {
+                            season: { type: 'string' },
+                            currentRound: { type: 'integer' },
+                            status: { type: 'string' },
+                            matches: { type: 'array', items: { $ref: '#/components/schemas/Match' } }
+                        }
+                    } 
+                } 
+            }
           }
         }
       }
@@ -80,10 +92,21 @@ const swaggerDefinition = {
     },
     '/api/teams': {
       get: {
-        summary: 'Listar equipos',
+        summary: 'Listar equipos (filtrables por temporada)',
         tags: ['Teams'],
+        parameters: [
+          { 
+            in: 'query', 
+            name: 'season', 
+            schema: { type: 'string' }, 
+            description: 'Año de la temporada (ej. 2026). Si se omite, devuelve todos.' 
+          }
+        ],
         responses: {
-          200: { description: 'Lista de equipos', content: { 'application/json': { schema: { type: 'array', items: { $ref: '#/components/schemas/Team' } } } } }
+          200: { 
+            description: 'Lista de equipos', 
+            content: { 'application/json': { schema: { type: 'array', items: { $ref: '#/components/schemas/Team' } } } } 
+          }
         }
       }
     },
@@ -102,9 +125,11 @@ const swaggerDefinition = {
   }
 };
 
+// 1. PRIMERO DEFINIMOS LAS OPCIONES
 const options: swaggerJSDoc.Options = {
   definition: swaggerDefinition,
-  apis: [], // YA NO BUSCAMOS EN ARCHIVOS, TODO ESTÁ AQUÍ
+  apis: [], 
 };
 
+// 2. DESPUÉS LAS USAMOS
 export const swaggerSpec = swaggerJSDoc(options);

@@ -17,12 +17,11 @@ export class ScraperService {
     return new Promise(resolve => setTimeout(resolve, delay));
   }
 
-  // --- CONFIGURACIÓN CENTRALIZADA DEL NAVEGADOR ---
   private async launchBrowser() {
     const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 
     return await (puppeteer as any).launch({ 
-      headless: 'new', // Modo invisible
+      headless: 'new',
       executablePath: executablePath,
       ignoreHTTPSErrors: true, 
       defaultViewport: null,
@@ -36,19 +35,11 @@ export class ScraperService {
     });
   }
 
-  // --- ELIMINADOR DE POPUPS ---
   private async removeCookiesBruteForce(page: any) {
     try {
         await page.evaluate(() => {
-            const selectorList = [
-                '#qc-cmp2-container', '.qc-cmp2-container', 
-                '#didomi-host', '.fc-consent-root', '.cookie-banner',
-                '#login_rf', '.generic_dialog', '#betAgeConfirm2', '#betBlur'
-            ];
-            selectorList.forEach(sel => { 
-                const el = document.querySelector(sel); 
-                if (el) el.remove(); 
-            });
+            const selectorList = ['#qc-cmp2-container', '.qc-cmp2-container', '#didomi-host', '.fc-consent-root', '.cookie-banner', '#login_rf', '.generic_dialog', '#betAgeConfirm2', '#betBlur'];
+            selectorList.forEach(sel => { const el = document.querySelector(sel); if (el) el.remove(); });
             const buttons = Array.from(document.querySelectorAll('button, a.btn'));
             buttons.forEach((btn: any) => {
                 const t = btn.innerText?.toUpperCase();
@@ -60,7 +51,6 @@ export class ScraperService {
     await this.randomDelay(500, 1000);
   }
 
-  // --- HELPERS RELACIONALES ---
   private async getOrCreateSeason(year: string): Promise<any> {
     let season = await Season.findOne({ year });
     if (!season) {
@@ -72,18 +62,20 @@ export class ScraperService {
 
   private async getOrCreateTeam(name: string, slug: string, logo: string | null): Promise<any> {
     let team = await Team.findOne({ slug });
+    
     if (!team) {
         team = await Team.create({ name, slug, logo });
-    } else if (logo && !team.logo) {
+    } else if (logo && (!team.logo || team.logo.includes('?'))) { 
+        // Si no tenía logo O si el logo antiguo tenía baja calidad (tenía ?), actualizamos
         team.logo = logo;
         await team.save();
     }
     return team;
   }
 
-  // --- SCRAPEO PROFUNDO (Detalle del Partido + Goles + Estadio) ---
+  // --- SCRAPEO PROFUNDO ---
   public async scrapeMatchDetail(matchUrl: string) {
-    console.log(`🔍 Analizando DETALLE: ${matchUrl}`);
+    console.log(`🔍 Analizando DETALLE COMPLETO: ${matchUrl}`);
     const browser = await this.launchBrowser();
 
     try {
@@ -102,12 +94,10 @@ export class ScraperService {
         });
 
         const details = await page.evaluate(() => {
-            // 1. ESTADIO
             let stadium = null;
             const stadiumEl = document.querySelector('li[itemprop="location"] span[itemprop="name"]');
             if (stadiumEl) stadium = stadiumEl.textContent?.replace('Estadio:', '').trim() || null;
 
-            // 2. MINUTO / ESTADO
             let currentMinute = null;
             const minEl = document.querySelector('.live_min') || document.querySelector('.jor-status');
             if (minEl) currentMinute = minEl.textContent?.trim();
@@ -121,7 +111,6 @@ export class ScraperService {
                 else if (txt.includes("SUSP")) computedStatus = 'SUSPENDED';
             }
 
-            // 3. MARCADOR
             let homeScore = null;
             let awayScore = null;
             const markers = document.querySelectorAll('.resultado .marker_box');
@@ -131,7 +120,6 @@ export class ScraperService {
                 if (!isNaN(homeScore) && !isNaN(awayScore) && computedStatus === 'SCHEDULED') computedStatus = 'FINISHED'; 
             }
 
-            // 4. EVENTOS (Goles)
             const events: any[] = [];
             const rows = document.querySelectorAll('.match-header-resume table tbody tr');
 
@@ -140,21 +128,9 @@ export class ScraperService {
                 if (goalIcon) {
                     const cells = Array.from(row.querySelectorAll('td'));
                     if (cells.length >= 7) {
-                        let minute = "";
-                        let player = "";
-                        let team = "";
-                        const score = cells[3]?.textContent?.trim() || ""; 
-
-                        if (cells[2].classList.contains('gol')) { 
-                            team = 'home';
-                            minute = cells[1].textContent?.trim() || "";
-                            player = cells[0].textContent?.trim() || "Local";
-                        } else if (cells[4].classList.contains('gol')) { 
-                            team = 'away';
-                            minute = cells[5].textContent?.trim() || "";
-                            player = cells[6].textContent?.trim() || "Visitante";
-                        }
-
+                        let minute = "", player = "", team = "", score = cells[3]?.textContent?.trim() || ""; 
+                        if (cells[2].classList.contains('gol')) { team = 'home'; minute = cells[1].textContent?.trim() || ""; player = cells[0].textContent?.trim() || ""; } 
+                        else if (cells[4].classList.contains('gol')) { team = 'away'; minute = cells[5].textContent?.trim() || ""; player = cells[6].textContent?.trim() || ""; }
                         if (minute) events.push({ minute, player, score, team });
                     }
                 }
@@ -173,10 +149,8 @@ export class ScraperService {
         if (details.awayScore !== null) updateData.awayScore = details.awayScore;
         if (details.computedStatus !== 'SCHEDULED') updateData.status = details.computedStatus;
 
-        // Actualizamos Partido
         const match = await Match.findOneAndUpdate({ matchUrl: matchUrl }, updateData, { new: true });
 
-        // Actualizamos Estadio en el Equipo Local
         if (match && details.stadium) {
             await Team.findByIdAndUpdate(match.homeTeam, { stadium: details.stadium });
         }
@@ -188,7 +162,7 @@ export class ScraperService {
     }
   }
 
-  // --- SCRAPEO GENERAL RELACIONAL (Jornada) ---
+  // --- SCRAPEO GENERAL ---
   public async scrapeRound(seasonYear: string, round: number) {
     const url = `https://www.resultados-futbol.com/competicion/primera/${seasonYear}/grupo1/jornada${round}`;
     console.log(`📡 Scrapeando: Temporada ${seasonYear} - Jornada ${round}`);
@@ -221,15 +195,20 @@ export class ScraperService {
             const homeName = row.querySelector('.equipo1')?.textContent?.trim() || homeSlug;
             const awayName = row.querySelector('.equipo2')?.textContent?.trim() || awaySlug;
 
-            // URL CORRECTA (Evita redirecciones genéricas)
             let specificUrl = row.querySelector('.rstd a')?.getAttribute('href');
             if (!specificUrl) specificUrl = `https://www.resultados-futbol.com/partido/${homeSlug}/${awaySlug}`;
             else if (!specificUrl.startsWith('http')) specificUrl = `https://www.resultados-futbol.com${specificUrl}`;
 
             const homeImg = row.querySelector('.equipo1 img');
             const awayImg = row.querySelector('.equipo2 img');
-            const homeLogo = homeImg?.getAttribute('data-src') || homeImg?.getAttribute('src') || null;
-            const awayLogo = awayImg?.getAttribute('data-src') || awayImg?.getAttribute('src') || null;
+            
+            // --- OBTENCIÓN DE LOGOS ---
+            let homeLogo = homeImg?.getAttribute('data-src') || homeImg?.getAttribute('src') || null;
+            let awayLogo = awayImg?.getAttribute('data-src') || awayImg?.getAttribute('src') || null;
+
+            // --- LIMPIEZA DE CALIDAD (HD) ---
+            if (homeLogo) homeLogo = homeLogo.split('?')[0];
+            if (awayLogo) awayLogo = awayLogo.split('?')[0];
 
             let rawDate = row.querySelector('.fecha')?.textContent?.trim() || "";
             let parsedDate = null;
@@ -292,7 +271,6 @@ export class ScraperService {
             $addToSet: { teams: { $each: [homeTeamDoc._id, awayTeamDoc._id] } }
         });
 
-        // Actualizamos usando IDs
         await Match.findOneAndUpdate(
             { season: seasonDoc._id, homeTeam: homeTeamDoc._id, awayTeam: awayTeamDoc._id }, 
             {
@@ -328,13 +306,11 @@ export class ScraperService {
     }
   }
 
-  // --- CRON JOB INTELIGENTE ---
+  // --- CRON ---
   public async updateLiveMatches() {
     if (ScraperService.isSeeding) return;
     const now = new Date();
     
-    // Buscar partidos por FECHA y ESTADO (no IDs directos)
-    // Populate necesario para sacar el año
     const liveMatch = await Match.findOne({
         matchDate: { 
             $gte: new Date(now.getTime() - 180 * 60000), 
