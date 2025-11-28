@@ -17,12 +17,12 @@ export class ScraperService {
     return new Promise(resolve => setTimeout(resolve, delay));
   }
 
-  // --- CONFIGURACIÓN NAVEGADOR ANTI-HUELLA ---
+  // --- CONFIGURACIÓN CENTRALIZADA DEL NAVEGADOR ---
   private async launchBrowser() {
     const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-    
+
     return await (puppeteer as any).launch({ 
-      headless: 'new',
+      headless: 'new', // Invisible
       executablePath: executablePath,
       ignoreHTTPSErrors: true, 
       defaultViewport: null,
@@ -31,46 +31,24 @@ export class ScraperService {
         '--disable-setuid-sandbox', 
         '--start-maximized',
         '--disable-dev-shm-usage',
-        '--disable-features=IsolateOrigins,site-per-process',
-        // Nuevos flags anti-detección básicos
-        '--disable-blink-features=AutomationControlled', 
-        '--disable-web-security'
+        '--disable-features=IsolateOrigins,site-per-process'
       ]
     });
   }
 
-  // --- INYECCIÓN DE EVASIÓN DE FINGERPRINTING ---
-  // Esta función inyecta código JS antes de cargar la página para mentir sobre la GPU y el Hardware
-  private async injectEvasions(page: any) {
-    await page.evaluateOnNewDocument(() => {
-        // 1. Spoofing de WebGL (Tarjeta Gráfica)
-        const getParameter = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function(parameter) {
-            // Si preguntan por el Vendor (Fabricante), decimos Intel
-            if (parameter === 37445) return 'Intel Inc.';
-            // Si preguntan por el Renderer (Modelo), decimos una gráfica común
-            if (parameter === 37446) return 'Intel(R) Iris(R) Xe Graphics';
-            return getParameter(parameter);
-        };
-
-        // 2. Spoofing de Hardware Concurrency (Núcleos CPU)
-        // Los servidores Docker suelen tener pocos núcleos, mentimos diciendo que tenemos 8
-        Object.defineProperty(navigator, 'hardwareConcurrency', {
-            get: () => 8,
-        });
-
-        // 3. Spoofing de Idiomas (Para parecer español nativo)
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['es-ES', 'es', 'en-US', 'en'],
-        });
-    });
-  }
-
+  // --- ELIMINADOR DE POPUPS ---
   private async removeCookiesBruteForce(page: any) {
     try {
         await page.evaluate(() => {
-            const selectorList = ['#qc-cmp2-container', '.qc-cmp2-container', '#didomi-host', '.fc-consent-root', '.cookie-banner', '#login_rf', '.generic_dialog', '#betAgeConfirm2', '#betBlur'];
-            selectorList.forEach(sel => { const el = document.querySelector(sel); if (el) el.remove(); });
+            const selectorList = [
+                '#qc-cmp2-container', '.qc-cmp2-container', 
+                '#didomi-host', '.fc-consent-root', '.cookie-banner',
+                '#login_rf', '.generic_dialog', '#betAgeConfirm2', '#betBlur'
+            ];
+            selectorList.forEach(sel => { 
+                const el = document.querySelector(sel); 
+                if (el) el.remove(); 
+            });
             const buttons = Array.from(document.querySelectorAll('button, a.btn'));
             buttons.forEach((btn: any) => {
                 const t = btn.innerText?.toUpperCase();
@@ -82,10 +60,12 @@ export class ScraperService {
     await this.randomDelay(500, 1000);
   }
 
+  // --- HELPERS RELACIONALES ---
   private async getOrCreateSeason(year: string): Promise<any> {
     let season = await Season.findOne({ year });
     if (!season) {
         season = await Season.create({ year, name: `Temporada ${parseInt(year)-1}/${year}` });
+        console.log(`🆕 Temporada creada: ${year}`);
     }
     return season;
   }
@@ -101,7 +81,7 @@ export class ScraperService {
     return team;
   }
 
-  // --- SCRAPEO PROFUNDO ---
+  // --- SCRAPEO PROFUNDO (Detalle + Marcador + Estado + Minuto Limpio) ---
   public async scrapeMatchDetail(matchUrl: string) {
     console.log(`🔍 Analizando DETALLE: ${matchUrl}`);
     const browser = await this.launchBrowser();
@@ -121,50 +101,36 @@ export class ScraperService {
             await new Promise(r => setTimeout(r, 1000));
         });
 
-        // --- 🛡️ GUARDIÁN DE COMPETICIÓN 🛡️ ---
-        // Verificamos si la web nos ha redirigido a otra competición (ej: Supercopa)
-        const competitionCheck = await page.evaluate(() => {
-            // Buscamos el texto del segundo enlace del menú de migas (crumbs)
-            // Estructura típica: Ligas > Primera División > Partido...
-            const crumb = document.querySelector('#crumbs li:nth-child(2) a')?.textContent?.trim();
-            return crumb || "";
-        });
-
-        // Si estamos en una competición que NO es Primera, abortamos y marcamos como Aplazado.
-        // (Ajusta "Primera División" si tu liga se llama diferente en la web)
-        if (competitionCheck && !competitionCheck.includes('Primera División')) {
-            console.warn(`⚠️ ALERTA: Redirección detectada a "${competitionCheck}". Este partido no es de Liga.`);
-            
-            // Forzamos estado APLAZADO y salimos para no guardar datos falsos
-            await Match.findOneAndUpdate(
-                { matchUrl: matchUrl },
-                { status: 'POSTPONED', stadium: null, homeScore: null, awayScore: null }
-            );
-            return; // <--- STOP AQUÍ
-        }
-
-        // --- SI PASA EL FILTRO, SEGUIMOS NORMAL ---
-
         const details = await page.evaluate(() => {
             // 1. ESTADIO
             let stadium = null;
             const stadiumEl = document.querySelector('li[itemprop="location"] span[itemprop="name"]');
-            if (stadiumEl) {
-                stadium = stadiumEl.textContent?.replace('Estadio:', '').trim() || null;
-            }
+            if (stadiumEl) stadium = stadiumEl.textContent?.replace('Estadio:', '').trim() || null;
 
-            // 2. MINUTO / ESTADO
-            let currentMinute = null;
+            // 2. LÓGICA DE ESTADO Y MINUTO
             const minEl = document.querySelector('.live_min') || document.querySelector('.jor-status');
-            if (minEl) currentMinute = minEl.textContent?.trim();
+            const rawText = minEl?.textContent?.trim() || "";
+            const upperText = rawText.toUpperCase();
 
             let computedStatus = 'SCHEDULED';
-            if (currentMinute) {
-                const txt = currentMinute.toUpperCase();
-                if (txt.includes('FIN') || txt.includes('TERMINADO')) computedStatus = 'FINISHED';
-                else if (txt.includes("'") || txt.includes("DES") || txt.includes("DIRECTO")) computedStatus = 'LIVE';
-                else if (txt.includes("APLAZ")) computedStatus = 'POSTPONED';
-                else if (txt.includes("SUSP")) computedStatus = 'SUSPENDED';
+            let finalMinute = null;
+
+            // Estado
+            if (upperText.includes('FIN') || upperText.includes('TERMINADO')) {
+                computedStatus = 'FINISHED';
+            } else if (upperText.includes("'") || upperText.includes("DES") || upperText.includes("DIRECTO")) {
+                computedStatus = 'LIVE';
+            } else if (upperText.includes("APLAZ")) {
+                computedStatus = 'POSTPONED';
+            } else if (upperText.includes("SUSP")) {
+                computedStatus = 'SUSPENDED';
+            }
+
+            // Minuto (Solo si es LIVE)
+            if (computedStatus === 'LIVE') {
+                const match = rawText.match(/\((.*?)\)/); 
+                if (match) finalMinute = match[1];
+                else finalMinute = rawText; 
             }
 
             // 3. MARCADOR
@@ -182,7 +148,6 @@ export class ScraperService {
             // 4. EVENTOS
             const events: any[] = [];
             const rows = document.querySelectorAll('.match-header-resume table tbody tr');
-
             rows.forEach(row => {
                 const goalIcon = row.querySelector('.mhr-ico.gol');
                 if (goalIcon) {
@@ -190,38 +155,31 @@ export class ScraperService {
                     if (cells.length >= 7) {
                         let minute = "", player = "", team = "", score = cells[3]?.textContent?.trim() || ""; 
                         if (cells[2].classList.contains('gol')) { 
-                            team = 'home';
-                            minute = cells[1].textContent?.trim() || "";
-                            player = cells[0].textContent?.trim() || "Local";
+                            team = 'home'; minute = cells[1].textContent?.trim() || ""; player = cells[0].textContent?.trim() || ""; 
                         } else if (cells[4].classList.contains('gol')) { 
-                            team = 'away';
-                            minute = cells[5].textContent?.trim() || "";
-                            player = cells[6].textContent?.trim() || "Visitante";
+                            team = 'away'; minute = cells[5].textContent?.trim() || ""; player = cells[6].textContent?.trim() || ""; 
                         }
                         if (minute) events.push({ minute, player, score, team });
                     }
                 }
             });
-            return { stadium, currentMinute, events, homeScore, awayScore, computedStatus };
+
+            return { stadium, currentMinute: finalMinute, events, homeScore, awayScore, computedStatus };
         });
 
-        console.log(`📝 Detalles: Estadio="${details.stadium}", Marcador=${details.homeScore}-${details.awayScore}, Estado=${details.computedStatus}`);
+        // 👇👇 AQUÍ ESTÁ EL CAMBIO: AÑADIDO EL MARCADOR AL LOG 👇👇
+        console.log(`📝 Detalles: Estadio="${details.stadium}", Marcador=${details.homeScore}-${details.awayScore}, Minuto="${details.currentMinute}", Estado=${details.computedStatus}`);
 
         const updateData: any = { 
             stadium: details.stadium,
             currentMinute: details.currentMinute,
             events: details.events,
         };
-
         if (details.homeScore !== null) updateData.homeScore = details.homeScore;
         if (details.awayScore !== null) updateData.awayScore = details.awayScore;
-        
-        // Solo actualizamos estado si no estaba ya en POSTPONED por el guardián (aunque aquí ya habríamos salido)
         if (details.computedStatus !== 'SCHEDULED') updateData.status = details.computedStatus;
 
         const match = await Match.findOneAndUpdate({ matchUrl: matchUrl }, updateData, { new: true });
-
-        // Solo actualizamos el estadio del equipo SI NO ES NULL (para no borrarlo si el partido falla)
         if (match && details.stadium) {
             await Team.findByIdAndUpdate(match.homeTeam, { stadium: details.stadium });
         }
@@ -233,21 +191,18 @@ export class ScraperService {
     }
   }
 
-  // --- SCRAPEO GENERAL ---
+  // --- SCRAPEO GENERAL (JORNADA) - CON AJUSTE HORARIO ---
   public async scrapeRound(seasonYear: string, round: number) {
     const url = `https://www.resultados-futbol.com/competicion/primera/${seasonYear}/grupo1/jornada${round}`;
     console.log(`📡 Scrapeando: Temporada ${seasonYear} - Jornada ${round}`);
+
     const seasonDoc = await this.getOrCreateSeason(seasonYear);
     const browser = await this.launchBrowser();
 
     try {
       const pages = await browser.pages();
       const page = pages.length > 0 ? pages[0] : await browser.newPage();
-      
-      // INYECTAMOS EVASIÓN TAMBIÉN AQUÍ
-      await this.injectEvasions(page);
-      
-      const userAgent = new UserAgent({ deviceCategory: 'desktop', platform: 'Win32' });
+      const userAgent = new UserAgent({ deviceCategory: 'desktop', platform: 'MacIntel' });
       await page.setUserAgent(userAgent.toString());
       
       try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 }); } catch (e) {}
@@ -255,18 +210,14 @@ export class ScraperService {
       await page.waitForSelector('tr.vevent', { timeout: 20000 });
 
       const startYear = parseInt(seasonYear) - 1; 
+
       const matchesData = await page.evaluate((seasonYear: any, round: any, startYear: any) => {
-        // ... (Mismo código de extracción de antes) ...
-        // Para no alargar la respuesta, mantén el mismo bloque 'page.evaluate' que ya tenías funcionando perfecto
-        // La lógica de extracción no cambia, solo la protección anti-bot.
-        
         const rows = document.querySelectorAll('tr.vevent');
         const results: any[] = [];
         const monthMap: Record<string, number> = { 'Ene':0, 'Feb':1, 'Mar':2, 'Abr':3, 'May':4, 'Jun':5, 'Jul':6, 'Ago':7, 'Sep':8, 'Oct':9, 'Nov':10, 'Dic':11 };
 
         rows.forEach((row) => {
-            // ... Copia aquí tu lógica de extracción de la versión anterior ...
-             const homeLink = row.querySelector('.equipo1 a')?.getAttribute('href'); 
+            const homeLink = row.querySelector('.equipo1 a')?.getAttribute('href'); 
             const awayLink = row.querySelector('.equipo2 a')?.getAttribute('href');
             const homeSlug = homeLink ? homeLink.split('/')[2] : null;
             const awaySlug = awayLink ? awayLink.split('/')[2] : null;
@@ -284,32 +235,64 @@ export class ScraperService {
             if (homeLogo) homeLogo = homeLogo.split('?')[0];
             if (awayLogo) awayLogo = awayLogo.split('?')[0];
 
-            let rawDate = row.querySelector('.fecha')?.textContent?.trim() || "";
-            let parsedDate = null;
-            rawDate = rawDate.replace(/\s+/g, ' '); 
-            const dateMatch = rawDate.match(/(\d{1,2})\s([A-Z][a-z]{2})(?:\s(\d{1,2}:\d{2}))?/);
-            if (dateMatch) {
-                const day = parseInt(dateMatch[1]);
-                const monthStr = dateMatch[2]; 
-                const timeStr = dateMatch[3] || "00:00"; 
-                const monthIndex = monthMap[monthStr] !== undefined ? monthMap[monthStr] : -1;
+            // --- PARSEO DE FECHA Y HORA (AJUSTE UTC) ---
+            let rawDateText = row.querySelector('.fecha')?.textContent?.trim() || "";
+            let statusText = row.querySelector('.rstd')?.textContent?.trim() || "";
+            
+            const cleanDateText = rawDateText.replace(/\s+/g, ' ').toUpperCase();
+            const cleanStatusText = statusText.replace(/\s+/g, ' ').toUpperCase();
+
+            // 1. Buscar la hora (21:00)
+            const timeMatch = cleanDateText.match(/(\d{1,2}:\d{2})/) || cleanStatusText.match(/(\d{1,2}:\d{2})/);
+            const timeStr = timeMatch ? timeMatch[1] : "00:00";
+
+            // 2. Determinar Día/Mes/Año
+            // Creamos la fecha directamente en UTC para evitar líos con la hora local del servidor
+            let year = startYear;
+            let monthIndex = 0;
+            let day = 1;
+            let dateFound = false;
+
+            const dateRegexMatch = rawDateText.match(/(\d{1,2})\s([A-Z][a-z]{2})/);
+            if (dateRegexMatch) {
+                day = parseInt(dateRegexMatch[1]);
+                const monthStr = dateRegexMatch[2];
+                monthIndex = monthMap[monthStr] !== undefined ? monthMap[monthStr] : -1;
                 if (monthIndex !== -1) {
-                    let year = startYear;
+                    // Ajuste de año
                     if (monthIndex < 6) year = parseInt(seasonYear);
-                    const [hours, minutes] = timeStr.split(':').map(Number);
-                    const d = new Date(year, monthIndex, day, hours, minutes);
-                    parsedDate = d.toISOString();
+                    dateFound = true;
                 }
             }
 
+            // Si la fecha es relativa (HOY/MAÑANA), usamos la fecha actual como base
+            if (!dateFound || cleanDateText.includes("HOY") || cleanDateText.includes("MAÑANA")) {
+                const now = new Date();
+                year = now.getFullYear();
+                monthIndex = now.getMonth();
+                day = now.getDate();
+                if (cleanDateText.includes("MAÑANA")) day += 1;
+                if (cleanDateText.includes("AYER")) day -= 1;
+            }
+
+            const [hours, minutes] = timeStr.split(':').map(Number);
+
+            // 3. Construir fecha en UTC con offset de España
+            // España es UTC+1 en invierno, UTC+2 en verano.
+            // Si restamos ese offset a la hora leída, obtenemos la hora UTC real para Mongo.
+            let offset = 1; // Invierno
+            if (monthIndex >= 3 && monthIndex <= 9) offset = 2; // Verano (Abril-Oct) aprox
+
+            // Date.UTC crea un timestamp. Al hacer new Date(timestamp), tenemos la fecha absoluta.
+            const finalDate = new Date(Date.UTC(year, monthIndex, day, hours - offset, minutes));
+
+            // --- ESTADO ---
             let homeScore = null;
             let awayScore = null;
             let status = 'SCHEDULED';
-            const statusText = row.querySelector('.rstd')?.textContent?.toUpperCase() || "";
-            const timeText = row.querySelector('.fecha')?.textContent?.toUpperCase() || "";
 
-            if (statusText.includes('APLAZ') || timeText.includes('APLAZ')) status = 'POSTPONED';
-            else if (statusText.includes('SUSP') || timeText.includes('SUSP')) status = 'SUSPENDED';
+            if (cleanStatusText.includes('APLAZ') || cleanDateText.includes('APLAZ')) status = 'POSTPONED';
+            else if (cleanStatusText.includes('SUSP') || cleanDateText.includes('SUSP')) status = 'SUSPENDED';
             else {
                 const markers = row.querySelectorAll('.marker_box');
                 if (markers.length >= 2) {
@@ -318,7 +301,7 @@ export class ScraperService {
                     if (s1 && s2 && !isNaN(parseInt(s1)) && !isNaN(parseInt(s2))) {
                         homeScore = parseInt(s1);
                         awayScore = parseInt(s2);
-                        if (rawDate.includes("'") || rawDate.includes("DES") || statusText.includes("'")) status = 'LIVE';
+                        if (cleanDateText.includes("'") || cleanDateText.includes("DES") || cleanStatusText.includes("'")) status = 'LIVE';
                         else status = 'FINISHED';
                     }
                 }
@@ -328,7 +311,9 @@ export class ScraperService {
                 results.push({
                     homeName, awayName, homeSlug, awaySlug, homeLogo, awayLogo,
                     homeScore, awayScore, status, matchUrl: specificUrl,
-                    round, matchDate: parsedDate ? parsedDate : new Date().toISOString()
+                    round, 
+                    matchDate: finalDate.toISOString(), // <--- FECHA CORREGIDA
+                    currentMinute: cleanStatusText
                 });
             }
         });
@@ -345,13 +330,16 @@ export class ScraperService {
             $addToSet: { teams: { $each: [homeTeamDoc._id, awayTeamDoc._id] } }
         });
 
+        const updateData: any = {
+            season: seasonDoc._id, homeTeam: homeTeamDoc._id, awayTeam: awayTeamDoc._id,
+            homeScore: m.homeScore, awayScore: m.awayScore, status: m.status,
+            matchDate: m.matchDate, round: m.round, matchUrl: m.matchUrl,
+        };
+        if (m.currentMinute && m.status === 'LIVE') updateData.currentMinute = m.currentMinute;
+
         await Match.findOneAndUpdate(
             { season: seasonDoc._id, homeTeam: homeTeamDoc._id, awayTeam: awayTeamDoc._id }, 
-            {
-                season: seasonDoc._id, homeTeam: homeTeamDoc._id, awayTeam: awayTeamDoc._id,
-                homeScore: m.homeScore, awayScore: m.awayScore, status: m.status,
-                matchDate: m.matchDate, round: m.round, matchUrl: m.matchUrl,
-            }, 
+            updateData, 
             { upsert: true, new: true }
         );
       }
@@ -362,6 +350,7 @@ export class ScraperService {
     }
   }
 
+  // --- SEED ---
   public async scrapeFullSeason(season: string) {
     if (ScraperService.isSeeding) return;
     ScraperService.isSeeding = true; 
@@ -379,6 +368,7 @@ export class ScraperService {
     }
   }
 
+  // --- CRON ---
   public async updateLiveMatches() {
     if (ScraperService.isSeeding) return;
     const now = new Date();
