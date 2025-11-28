@@ -17,38 +17,22 @@ export class ScraperService {
     return new Promise(resolve => setTimeout(resolve, delay));
   }
 
-  // --- CONFIGURACIÓN CENTRALIZADA DEL NAVEGADOR ---
   private async launchBrowser() {
     const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-
     return await (puppeteer as any).launch({ 
-      headless: 'new', // Invisible
+      headless: 'new',
       executablePath: executablePath,
       ignoreHTTPSErrors: true, 
       defaultViewport: null,
-      args: [
-        '--no-sandbox', 
-        '--disable-setuid-sandbox', 
-        '--start-maximized',
-        '--disable-dev-shm-usage',
-        '--disable-features=IsolateOrigins,site-per-process'
-      ]
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--start-maximized', '--disable-dev-shm-usage', '--disable-features=IsolateOrigins,site-per-process']
     });
   }
 
-  // --- ELIMINADOR DE POPUPS ---
   private async removeCookiesBruteForce(page: any) {
     try {
         await page.evaluate(() => {
-            const selectorList = [
-                '#qc-cmp2-container', '.qc-cmp2-container', 
-                '#didomi-host', '.fc-consent-root', '.cookie-banner',
-                '#login_rf', '.generic_dialog', '#betAgeConfirm2', '#betBlur'
-            ];
-            selectorList.forEach(sel => { 
-                const el = document.querySelector(sel); 
-                if (el) el.remove(); 
-            });
+            const selectorList = ['#qc-cmp2-container', '.qc-cmp2-container', '#didomi-host', '.fc-consent-root', '.cookie-banner', '#login_rf', '.generic_dialog', '#betAgeConfirm2', '#betBlur'];
+            selectorList.forEach(sel => { const el = document.querySelector(sel); if (el) el.remove(); });
             const buttons = Array.from(document.querySelectorAll('button, a.btn'));
             buttons.forEach((btn: any) => {
                 const t = btn.innerText?.toUpperCase();
@@ -60,12 +44,10 @@ export class ScraperService {
     await this.randomDelay(500, 1000);
   }
 
-  // --- HELPERS RELACIONALES ---
   private async getOrCreateSeason(year: string): Promise<any> {
     let season = await Season.findOne({ year });
     if (!season) {
         season = await Season.create({ year, name: `Temporada ${parseInt(year)-1}/${year}` });
-        console.log(`🆕 Temporada creada: ${year}`);
     }
     return season;
   }
@@ -81,7 +63,7 @@ export class ScraperService {
     return team;
   }
 
-  // --- SCRAPEO PROFUNDO (Detalle + Marcador + Estado + Minuto Limpio) ---
+  // --- SCRAPEO PROFUNDO (Protegido) ---
   public async scrapeMatchDetail(matchUrl: string) {
     console.log(`🔍 Analizando DETALLE: ${matchUrl}`);
     const browser = await this.launchBrowser();
@@ -95,19 +77,17 @@ export class ScraperService {
         try { await page.goto(matchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }); } catch (e) {}
         
         await this.removeCookiesBruteForce(page);
-        
         await page.evaluate(async () => {
             window.scrollBy(0, 500);
             await new Promise(r => setTimeout(r, 1000));
         });
 
         const details = await page.evaluate(() => {
-            // 1. ESTADIO
             let stadium = null;
             const stadiumEl = document.querySelector('li[itemprop="location"] span[itemprop="name"]');
             if (stadiumEl) stadium = stadiumEl.textContent?.replace('Estadio:', '').trim() || null;
 
-            // 2. LÓGICA DE ESTADO Y MINUTO
+            let currentMinute = null;
             const minEl = document.querySelector('.live_min') || document.querySelector('.jor-status');
             const rawText = minEl?.textContent?.trim() || "";
             const upperText = rawText.toUpperCase();
@@ -115,7 +95,6 @@ export class ScraperService {
             let computedStatus = 'SCHEDULED';
             let finalMinute = null;
 
-            // Estado
             if (upperText.includes('FIN') || upperText.includes('TERMINADO')) {
                 computedStatus = 'FINISHED';
             } else if (upperText.includes("'") || upperText.includes("DES") || upperText.includes("DIRECTO")) {
@@ -126,14 +105,12 @@ export class ScraperService {
                 computedStatus = 'SUSPENDED';
             }
 
-            // Minuto (Solo si es LIVE)
             if (computedStatus === 'LIVE') {
                 const match = rawText.match(/\((.*?)\)/); 
                 if (match) finalMinute = match[1];
                 else finalMinute = rawText; 
             }
 
-            // 3. MARCADOR
             let homeScore = null;
             let awayScore = null;
             const markers = document.querySelectorAll('.resultado .marker_box');
@@ -145,7 +122,6 @@ export class ScraperService {
                 }
             }
 
-            // 4. EVENTOS
             const events: any[] = [];
             const rows = document.querySelectorAll('.match-header-resume table tbody tr');
             rows.forEach(row => {
@@ -155,34 +131,39 @@ export class ScraperService {
                     if (cells.length >= 7) {
                         let minute = "", player = "", team = "", score = cells[3]?.textContent?.trim() || ""; 
                         if (cells[2].classList.contains('gol')) { 
-                            team = 'home'; minute = cells[1].textContent?.trim() || ""; player = cells[0].textContent?.trim() || ""; 
+                            team = 'home'; minute = cells[1].textContent?.trim() || ""; player = cells[0].textContent?.trim() || "Local"; 
                         } else if (cells[4].classList.contains('gol')) { 
-                            team = 'away'; minute = cells[5].textContent?.trim() || ""; player = cells[6].textContent?.trim() || ""; 
+                            team = 'away'; minute = cells[5].textContent?.trim() || ""; player = cells[6].textContent?.trim() || "Visitante"; 
                         }
                         if (minute) events.push({ minute, player, score, team });
                     }
                 }
             });
-
             return { stadium, currentMinute: finalMinute, events, homeScore, awayScore, computedStatus };
         });
 
-        // 👇👇 AQUÍ ESTÁ EL CAMBIO: AÑADIDO EL MARCADOR AL LOG 👇👇
+        // --- PROTECCIÓN ANTI-FLICKER DETALLE ---
+        const currentMatchInDB = await Match.findOne({ matchUrl: matchUrl }).select('status');
+        if (currentMatchInDB && (currentMatchInDB.status === 'LIVE' || currentMatchInDB.status === 'FINISHED')) {
+            if (details.computedStatus === 'SCHEDULED') {
+                console.log("🛡️ Protección Detalle: El scraper falló, mantenemos estado anterior.");
+                details.computedStatus = currentMatchInDB.status; // Mantenemos el estado real
+            }
+        }
+
         console.log(`📝 Detalles: Estadio="${details.stadium}", Marcador=${details.homeScore}-${details.awayScore}, Minuto="${details.currentMinute}", Estado=${details.computedStatus}`);
 
         const updateData: any = { 
             stadium: details.stadium,
             currentMinute: details.currentMinute,
             events: details.events,
+            status: details.computedStatus // Usamos el estado protegido
         };
         if (details.homeScore !== null) updateData.homeScore = details.homeScore;
         if (details.awayScore !== null) updateData.awayScore = details.awayScore;
-        if (details.computedStatus !== 'SCHEDULED') updateData.status = details.computedStatus;
 
         const match = await Match.findOneAndUpdate({ matchUrl: matchUrl }, updateData, { new: true });
-        if (match && details.stadium) {
-            await Team.findByIdAndUpdate(match.homeTeam, { stadium: details.stadium });
-        }
+        if (match && details.stadium) await Team.findByIdAndUpdate(match.homeTeam, { stadium: details.stadium });
 
     } catch (error) {
         console.error("❌ Error en detalle:", error);
@@ -191,7 +172,7 @@ export class ScraperService {
     }
   }
 
-  // --- SCRAPEO GENERAL (JORNADA) - CON AJUSTE HORARIO ---
+  // --- SCRAPEO GENERAL (JORNADA) - CON PROTECCIÓN TOTAL ---
   public async scrapeRound(seasonYear: string, round: number) {
     const url = `https://www.resultados-futbol.com/competicion/primera/${seasonYear}/grupo1/jornada${round}`;
     console.log(`📡 Scrapeando: Temporada ${seasonYear} - Jornada ${round}`);
@@ -235,58 +216,38 @@ export class ScraperService {
             if (homeLogo) homeLogo = homeLogo.split('?')[0];
             if (awayLogo) awayLogo = awayLogo.split('?')[0];
 
-            // --- PARSEO DE FECHA Y HORA (AJUSTE UTC) ---
             let rawDateText = row.querySelector('.fecha')?.textContent?.trim() || "";
             let statusText = row.querySelector('.rstd')?.textContent?.trim() || "";
-            
             const cleanDateText = rawDateText.replace(/\s+/g, ' ').toUpperCase();
             const cleanStatusText = statusText.replace(/\s+/g, ' ').toUpperCase();
 
-            // 1. Buscar la hora (21:00)
             const timeMatch = cleanDateText.match(/(\d{1,2}:\d{2})/) || cleanStatusText.match(/(\d{1,2}:\d{2})/);
             const timeStr = timeMatch ? timeMatch[1] : "00:00";
 
-            // 2. Determinar Día/Mes/Año
-            // Creamos la fecha directamente en UTC para evitar líos con la hora local del servidor
-            let year = startYear;
-            let monthIndex = 0;
-            let day = 1;
-            let dateFound = false;
-
-            const dateRegexMatch = rawDateText.match(/(\d{1,2})\s([A-Z][a-z]{2})/);
-            if (dateRegexMatch) {
-                day = parseInt(dateRegexMatch[1]);
-                const monthStr = dateRegexMatch[2];
-                monthIndex = monthMap[monthStr] !== undefined ? monthMap[monthStr] : -1;
-                if (monthIndex !== -1) {
-                    // Ajuste de año
-                    if (monthIndex < 6) year = parseInt(seasonYear);
-                    dateFound = true;
+            let targetDate = new Date();
+            if (cleanDateText.includes("HOY")) { /* hoy */ } 
+            else if (cleanDateText.includes("MAÑANA")) { targetDate.setDate(targetDate.getDate() + 1); } 
+            else if (cleanDateText.includes("AYER")) { targetDate.setDate(targetDate.getDate() - 1); } 
+            else {
+                const dateRegexMatch = rawDateText.match(/(\d{1,2})\s([A-Z][a-z]{2})/);
+                if (dateRegexMatch) {
+                    const day = parseInt(dateRegexMatch[1]);
+                    const monthStr = dateRegexMatch[2];
+                    const monthIndex = monthMap[monthStr] !== undefined ? monthMap[monthStr] : -1;
+                    if (monthIndex !== -1) {
+                        let year = startYear;
+                        if (monthIndex < 6) year = parseInt(seasonYear);
+                        targetDate = new Date(year, monthIndex, day);
+                    }
                 }
             }
 
-            // Si la fecha es relativa (HOY/MAÑANA), usamos la fecha actual como base
-            if (!dateFound || cleanDateText.includes("HOY") || cleanDateText.includes("MAÑANA")) {
-                const now = new Date();
-                year = now.getFullYear();
-                monthIndex = now.getMonth();
-                day = now.getDate();
-                if (cleanDateText.includes("MAÑANA")) day += 1;
-                if (cleanDateText.includes("AYER")) day -= 1;
-            }
-
             const [hours, minutes] = timeStr.split(':').map(Number);
+            let offset = 1; 
+            const m = targetDate.getMonth();
+            if (m >= 3 && m <= 9) offset = 2; 
+            const finalDate = new Date(Date.UTC(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate(), hours - offset, minutes));
 
-            // 3. Construir fecha en UTC con offset de España
-            // España es UTC+1 en invierno, UTC+2 en verano.
-            // Si restamos ese offset a la hora leída, obtenemos la hora UTC real para Mongo.
-            let offset = 1; // Invierno
-            if (monthIndex >= 3 && monthIndex <= 9) offset = 2; // Verano (Abril-Oct) aprox
-
-            // Date.UTC crea un timestamp. Al hacer new Date(timestamp), tenemos la fecha absoluta.
-            const finalDate = new Date(Date.UTC(year, monthIndex, day, hours - offset, minutes));
-
-            // --- ESTADO ---
             let homeScore = null;
             let awayScore = null;
             let status = 'SCHEDULED';
@@ -311,9 +272,8 @@ export class ScraperService {
                 results.push({
                     homeName, awayName, homeSlug, awaySlug, homeLogo, awayLogo,
                     homeScore, awayScore, status, matchUrl: specificUrl,
-                    round, 
-                    matchDate: finalDate.toISOString(), // <--- FECHA CORREGIDA
-                    currentMinute: cleanStatusText
+                    round, matchDate: finalDate.toISOString(),
+                    currentMinute: cleanStatusText 
                 });
             }
         });
@@ -330,16 +290,38 @@ export class ScraperService {
             $addToSet: { teams: { $each: [homeTeamDoc._id, awayTeamDoc._id] } }
         });
 
+        // --- LÓGICA DE PROTECCIÓN ANTI-FLICKER JORNADA ---
+        const existingMatch = await Match.findOne({ 
+            season: seasonDoc._id, homeTeam: homeTeamDoc._id, awayTeam: awayTeamDoc._id 
+        });
+
+        // Si en la BD ya está LIVE o FINISHED, y el nuevo status es SCHEDULED (error), lo ignoramos
+        if (existingMatch && (existingMatch.status === 'LIVE' || existingMatch.status === 'FINISHED')) {
+            if (m.status === 'SCHEDULED') {
+                // console.log(`🛡️ Protección Jornada: ${m.homeName} vs ${m.awayName} se mantiene ${existingMatch.status}`);
+                m.status = existingMatch.status; // Forzamos el estado antiguo
+                // También mantenemos el resultado antiguo si el nuevo es null
+                if (m.homeScore === null) {
+                    m.homeScore = existingMatch.homeScore;
+                    m.awayScore = existingMatch.awayScore;
+                }
+            }
+        }
+
         const updateData: any = {
             season: seasonDoc._id, homeTeam: homeTeamDoc._id, awayTeam: awayTeamDoc._id,
-            homeScore: m.homeScore, awayScore: m.awayScore, status: m.status,
-            matchDate: m.matchDate, round: m.round, matchUrl: m.matchUrl,
+            round: m.round, matchUrl: m.matchUrl, status: m.status
         };
+        
+        if (m.matchDate) updateData.matchDate = m.matchDate;
+        if (m.homeScore !== null) updateData.homeScore = m.homeScore;
+        if (m.awayScore !== null) updateData.awayScore = m.awayScore;
+        // Solo actualizamos minuto desde la jornada si es LIVE
         if (m.currentMinute && m.status === 'LIVE') updateData.currentMinute = m.currentMinute;
 
         await Match.findOneAndUpdate(
             { season: seasonDoc._id, homeTeam: homeTeamDoc._id, awayTeam: awayTeamDoc._id }, 
-            updateData, 
+            { $set: updateData }, 
             { upsert: true, new: true }
         );
       }
@@ -350,25 +332,18 @@ export class ScraperService {
     }
   }
 
-  // --- SEED ---
   public async scrapeFullSeason(season: string) {
     if (ScraperService.isSeeding) return;
     ScraperService.isSeeding = true; 
-    console.log(`🚀 Iniciando CARGA de la temporada ${season}...`);
     try {
         for (let i = 1; i <= 38; i++) {
             await this.scrapeRound(season, i);
             await new Promise(r => setTimeout(r, 2000));
         }
-        console.log("🏁 CARGA COMPLETADA.");
-    } catch (e) {
-        console.error("Error en carga masiva:", e);
-    } finally {
-        ScraperService.isSeeding = false; 
-    }
+    } catch (e) { console.error(e); } 
+    finally { ScraperService.isSeeding = false; }
   }
 
-  // --- CRON ---
   public async updateLiveMatches() {
     if (ScraperService.isSeeding) return;
     const now = new Date();
