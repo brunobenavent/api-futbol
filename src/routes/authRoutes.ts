@@ -1,0 +1,11 @@
+import { Router } from 'express';
+import { register, login, approveUser, verifyCode, forgotPassword, resetPassword, getProfile } from '../controllers/AuthController.js';
+const router = Router();
+router.post('/register', register);
+router.post('/login', login);
+router.post('/approve', approveUser);
+router.post('/verify', verifyCode);
+router.post('/forgot-password', forgotPassword);
+router.post('/reset-password', resetPassword);
+router.get('/profile/:id', getProfile);
+export default router;

@@ -1,19 +1,19 @@
 import express, { Application } from 'express';
+import swaggerUi from 'swagger-ui-express';
+import { swaggerSpec } from './config/swagger.js';
 
 // Importamos los enrutadores
 import matchRoutes from './routes/matchRoutes.js';
 import teamRoutes from './routes/teamRoutes.js';
 import adminRoutes from './routes/adminRoutes.js';
-
-// --- IMPORTACIONES DE SWAGGER (ESTO TE FALTABA) ---
-import swaggerUi from 'swagger-ui-express'; 
-import { swaggerSpec } from './config/swagger.js'; 
+import authRoutes from './routes/authRoutes.js'; // <--- NUEVO (Auth)
 
 const app: Application = express();
 
+// Middleware para leer JSON en el body de las peticiones (Login, Registro, etc.)
 app.use(express.json());
 
-// Ruta Base
+// Ruta Base (Ping)
 app.get('/', (req, res) => {
   res.send('API de Fútbol Scraper funcionando ⚽️');
 });
@@ -26,7 +26,10 @@ app.use('/api/matches', matchRoutes);
 // 2. Rutas de Equipos (Prefijo: /api/teams)
 app.use('/api/teams', teamRoutes);
 
-// 3. Rutas de Admin/Scraping
+// 3. Rutas de Autenticación (Prefijo: /api/auth)
+app.use('/api/auth', authRoutes);
+
+// 4. Rutas de Admin/Scraping (Sin prefijo extra, ya vienen definidos en el router)
 app.use('/', adminRoutes);
 
 // --- DOCUMENTACIÓN SWAGGER ---
