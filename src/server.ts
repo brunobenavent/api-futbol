@@ -1,3 +1,7 @@
+import dotenv from 'dotenv';
+dotenv.config();
+
+
 import app from './app.js';
 import { connectDB } from './config/db.js';
 // 👇 IMPORTANTE: Importamos el iniciador de tareas (Recuerda el .js)

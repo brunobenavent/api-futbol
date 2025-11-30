@@ -19,7 +19,6 @@ export class ScraperService {
 
   // --- CONFIGURACIÓN CENTRALIZADA DEL NAVEGADOR ---
   private async launchBrowser() {
-    // Detecta ruta automáticamente (Render vs Local)
     const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 
     return await (puppeteer as any).launch({ 
@@ -32,8 +31,24 @@ export class ScraperService {
         '--disable-setuid-sandbox', 
         '--start-maximized',
         '--disable-dev-shm-usage',
-        '--disable-features=IsolateOrigins,site-per-process'
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-web-security'
       ]
+    });
+  }
+
+  // --- INYECCIÓN DE EVASIÓN DE FINGERPRINTING ---
+  private async injectEvasions(page: any) {
+    await page.evaluateOnNewDocument(() => {
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) return 'Intel Inc.';
+            if (parameter === 37446) return 'Intel(R) Iris(R) Xe Graphics';
+            return getParameter(parameter);
+        };
+        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+        Object.defineProperty(navigator, 'languages', { get: () => ['es-ES', 'es', 'en-US', 'en'] });
     });
   }
 
@@ -66,7 +81,6 @@ export class ScraperService {
     let season = await Season.findOne({ year });
     if (!season) {
         season = await Season.create({ year, name: `Temporada ${parseInt(year)-1}/${year}` });
-        console.log(`🆕 Temporada creada: ${year}`);
     }
     return season;
   }
@@ -82,22 +96,23 @@ export class ScraperService {
     return team;
   }
 
-  // --- SCRAPEO PROFUNDO (Detalle + Limpieza Estricta de Minuto) ---
+  // --- SCRAPEO PROFUNDO (Detalle + Marcador + Estado + Minuto Limpio + Anti-Flicker) ---
   public async scrapeMatchDetail(matchUrl: string) {
-    console.log(`🔍 Analizando DETALLE: ${matchUrl}`);
+    console.log(`🔍 Analizando DETALLE COMPLETO: ${matchUrl}`);
     const browser = await this.launchBrowser();
 
     try {
         const pages = await browser.pages();
         const page = pages.length > 0 ? pages[0] : await browser.newPage();
-        const userAgent = new UserAgent({ deviceCategory: 'desktop' });
+        
+        await this.injectEvasions(page);
+        const userAgent = new UserAgent({ deviceCategory: 'desktop', platform: 'Win32' });
         await page.setUserAgent(userAgent.toString());
 
         try { await page.goto(matchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }); } catch (e) {}
         
         await this.removeCookiesBruteForce(page);
         
-        // Scroll para cargar datos
         await page.evaluate(async () => {
             window.scrollBy(0, 500);
             await new Promise(r => setTimeout(r, 1000));
@@ -107,53 +122,36 @@ export class ScraperService {
             // 1. ESTADIO
             let stadium = null;
             const stadiumEl = document.querySelector('li[itemprop="location"] span[itemprop="name"]');
-            if (stadiumEl) stadium = stadiumEl.textContent?.replace('Estadio:', '').trim() || null;
+            if (stadiumEl) {
+                stadium = stadiumEl.textContent?.replace('Estadio:', '').trim() || null;
+            }
 
-            // 2. MINUTO / ESTADO (LÓGICA BLINDADA)
+            // 2. LÓGICA DE ESTADO Y MINUTO (MEJORADA)
             const minEl = document.querySelector('.live_min') || document.querySelector('.jor-status');
-            let rawText = minEl?.textContent?.trim() || "";
+            const rawText = minEl?.textContent?.trim() || "";
             const upperText = rawText.toUpperCase();
 
             let computedStatus = 'SCHEDULED';
             let finalMinute = null;
 
-            // Detección de estado
+            // Calculamos estado basado en el texto
             if (upperText.includes('FIN') || upperText.includes('TERMINADO')) {
                 computedStatus = 'FINISHED';
+            } else if (upperText.includes("'") || upperText.includes("DES") || upperText.includes("DIRECTO")) {
+                computedStatus = 'LIVE';
             } else if (upperText.includes("APLAZ")) {
                 computedStatus = 'POSTPONED';
             } else if (upperText.includes("SUSP")) {
                 computedStatus = 'SUSPENDED';
-            } 
-            // Detección de LIVE estricta
-            else if (upperText.includes("'") || upperText.includes("DES") || upperText.includes("DIRECTO")) {
-                computedStatus = 'LIVE';
             }
 
-            // Limpieza de minuto (Evitar textos largos basura)
+            // SOLO guardamos el minuto si está LIVE
             if (computedStatus === 'LIVE') {
-                // Si el texto es muy largo (basura), intentamos rescatar solo el patrón "XX'"
-                if (rawText.length > 15) {
-                     const cleanMatch = rawText.match(/(\d+\+?\d*')/); // Busca números + comilla
-                     if (cleanMatch) {
-                         finalMinute = cleanMatch[1]; 
-                     } else if (upperText.includes("DES")) {
-                         finalMinute = "DES";
-                     } else {
-                         // Si es largo y no tiene formato de minuto, probablemente no sea el minuto
-                         computedStatus = 'SCHEDULED'; 
-                         finalMinute = null;
-                     }
-                } else {
-                    // Texto corto (normal)
-                    const match = rawText.match(/\((.*?)\)/); // Saca (30') de DIRECTO (30')
-                    if (match) finalMinute = match[1];
-                    else finalMinute = rawText; // Ej: "DES" o "45'"
-                }
-            } else {
-                // Si no está LIVE, el minuto siempre es NULL (Limpia "HOY", "MAÑANA")
-                finalMinute = null;
-            }
+                // Si pone "DIRECTO (30')", sacamos el 30'
+                const match = rawText.match(/\((.*?)\)/); 
+                if (match) finalMinute = match[1];
+                else finalMinute = rawText; // Ej: "DES"
+            } 
 
             // 3. MARCADOR
             let homeScore = null;
@@ -168,7 +166,7 @@ export class ScraperService {
                 }
             }
 
-            // 4. EVENTOS (Goles)
+            // 4. EVENTOS
             const events: any[] = [];
             const rows = document.querySelectorAll('.match-header-resume table tbody tr');
             rows.forEach(row => {
@@ -190,11 +188,13 @@ export class ScraperService {
             return { stadium, currentMinute: finalMinute, events, homeScore, awayScore, computedStatus };
         });
 
-        // --- PROTECCIÓN ANTI-FLICKER ---
+        // --- LÓGICA DE PROTECCIÓN (ANTI-FLICKER) ---
         const currentMatchInDB = await Match.findOne({ matchUrl: matchUrl }).select('status');
+        
         if (currentMatchInDB && currentMatchInDB.status === 'LIVE') {
+            // Si en BD estaba LIVE, pero el scraper dice SCHEDULED (fallo momentáneo), mantenemos LIVE.
             if (details.computedStatus === 'SCHEDULED') {
-                console.log("🛡️ Protección: Mantenemos LIVE aunque falle el scraper.");
+                console.log("🛡️ Protección activada: Mantenemos LIVE aunque el scraper no vio tiempo.");
                 details.computedStatus = 'LIVE';
             }
         }
@@ -234,7 +234,9 @@ export class ScraperService {
     try {
       const pages = await browser.pages();
       const page = pages.length > 0 ? pages[0] : await browser.newPage();
-      const userAgent = new UserAgent({ deviceCategory: 'desktop', platform: 'MacIntel' });
+      
+      await this.injectEvasions(page);
+      const userAgent = new UserAgent({ deviceCategory: 'desktop', platform: 'Win32' });
       await page.setUserAgent(userAgent.toString());
       
       try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 }); } catch (e) {}
@@ -267,7 +269,7 @@ export class ScraperService {
             if (homeLogo) homeLogo = homeLogo.split('?')[0];
             if (awayLogo) awayLogo = awayLogo.split('?')[0];
 
-            // Fecha Inteligente
+            // Fecha Inteligente (UTC Offset)
             let rawDateText = row.querySelector('.fecha')?.textContent?.trim() || "";
             let statusText = row.querySelector('.rstd')?.textContent?.trim() || "";
             const cleanDateText = rawDateText.replace(/\s+/g, ' ').toUpperCase();
@@ -300,22 +302,28 @@ export class ScraperService {
             if (m >= 3 && m <= 9) offset = 2; 
             const finalDate = new Date(Date.UTC(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate(), hours - offset, minutes));
 
-            // Estado
+            // Algoritmo Jerárquico de Estado
             let homeScore = null;
             let awayScore = null;
             let status = 'SCHEDULED';
 
+            // 1. Aplazado/Suspendido
             if (cleanStatusText.includes('APLAZ') || cleanDateText.includes('APLAZ')) status = 'POSTPONED';
             else if (cleanStatusText.includes('SUSP') || cleanDateText.includes('SUSP')) status = 'SUSPENDED';
+            // 2. En Juego (Live)
             else {
                 const markers = row.querySelectorAll('.marker_box');
-                if (markers.length >= 2) {
+                // Comprobamos primero indicadores claros de live
+                const isLiveText = cleanDateText.includes("'") || cleanDateText.includes("DES") || cleanStatusText.includes("'");
+                const hasMarkers = markers.length >= 2;
+
+                if (hasMarkers) {
                     const s1 = markers[0].textContent?.trim();
                     const s2 = markers[1].textContent?.trim();
                     if (s1 && s2 && !isNaN(parseInt(s1)) && !isNaN(parseInt(s2))) {
                         homeScore = parseInt(s1);
                         awayScore = parseInt(s2);
-                        if (cleanDateText.includes("'") || cleanDateText.includes("DES") || cleanStatusText.includes("'")) status = 'LIVE';
+                        if (isLiveText) status = 'LIVE';
                         else status = 'FINISHED';
                     }
                 }
@@ -351,8 +359,6 @@ export class ScraperService {
         if (m.homeScore !== null) updateData.homeScore = m.homeScore;
         if (m.awayScore !== null) updateData.awayScore = m.awayScore;
         if (m.status !== 'SCHEDULED') updateData.status = m.status;
-        
-        // Solo si es LIVE guardamos el minuto sucio (el detalle lo limpia luego)
         if (m.currentMinute && m.status === 'LIVE') updateData.currentMinute = m.currentMinute;
 
         await Match.findOneAndUpdate(
@@ -368,7 +374,7 @@ export class ScraperService {
     }
   }
 
-  // ... (scrapeFullSeason y updateLiveMatches siguen igual) ...
+  // --- MANTENIMIENTO Y CRON ---
   public async scrapeFullSeason(season: string) {
     if (ScraperService.isSeeding) return;
     ScraperService.isSeeding = true; 

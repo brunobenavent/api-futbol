@@ -24,6 +24,7 @@ const UserSchema: Schema = new Schema({
   alias: { type: String, required: true, unique: true },
   slug: { type: String, unique: true },
   email: { type: String, required: true, unique: true },
+  password: { type: String, select: false }, 
   phone: { type: String },
   avatar: { type: String, default: 'default_avatar.png' },
   role: { type: String, enum: ['ADMIN', 'USER'], default: 'USER' },
@@ -33,31 +34,32 @@ const UserSchema: Schema = new Schema({
     default: 'PENDING_APPROVAL' 
   },
   verificationCode: { type: String, select: false },
-  password: { type: String, select: false }, 
   resetPasswordToken: { type: String, select: false },
   resetPasswordExpires: { type: Date, select: false },
   tokens: { type: Number, default: 0 }
 }, { timestamps: true });
 
-// Middleware Slug
-UserSchema.pre('save', function(next: any) {
-  const user = this as unknown as IUser;
+// --- MIDDLEWARE 1: SLUG (AHORA ASÍNCRONO SIN NEXT) ---
+UserSchema.pre('save', async function() {
+  const user = this as any;
   if (user.isModified('alias')) {
     const aliasStr = String(user.alias);
     user.slug = aliasStr.trim().toLowerCase().replace(/ /g, '-').replace(/[^\w-]+/g, '');
   }
-  next();
+  // Sin next(). La promesa resuelve sola.
 });
 
-// Middleware Hash Password
-UserSchema.pre('save', async function(next: any) {
+// --- MIDDLEWARE 2: HASH PASSWORD (ASÍNCRONO SIN NEXT) ---
+UserSchema.pre('save', async function() {
     const user = this as any;
-    if (!user.isModified('password')) return next();
+    if (!user.isModified('password') || !user.password) return; 
+
     try {
       const salt = await bcrypt.genSalt(10);
       user.password = await bcrypt.hash(user.password, salt);
-      next();
-    } catch (error) { return next(error); }
+    } catch (error: any) { 
+        throw new Error("Error hashing password."); 
+    }
 });
 
 const User = mongoose.model<IUser>('User', UserSchema);

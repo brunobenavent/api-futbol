@@ -7,6 +7,7 @@ import matchRoutes from './routes/matchRoutes.js';
 import teamRoutes from './routes/teamRoutes.js';
 import adminRoutes from './routes/adminRoutes.js';
 import authRoutes from './routes/authRoutes.js'; // <--- NUEVO (Auth)
+import gameRoutes from './routes/gameRoutes.js';
 
 const app: Application = express();
 
@@ -28,6 +29,9 @@ app.use('/api/teams', teamRoutes);
 
 // 3. Rutas de Autenticación (Prefijo: /api/auth)
 app.use('/api/auth', authRoutes);
+
+
+app.use('/api/game', gameRoutes);
 
 // 4. Rutas de Admin/Scraping (Sin prefijo extra, ya vienen definidos en el router)
 app.use('/', adminRoutes);

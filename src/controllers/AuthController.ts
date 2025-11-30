@@ -1,21 +1,25 @@
 import { Request, Response } from 'express';
-import jwt from 'jsonwebtoken';
 import User from '../models/User.js';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
+import jwt, { Secret, SignOptions } from 'jsonwebtoken';
+import { sendVerificationEmail, sendResetPasswordEmail, sendAdminNotification } from '../services/EmailService.js';
 
-
-// Helper para firmar tokens (TIPADO CORRECTO)
-// Forzamos el tipado de las variables de entorno y las opciones
+// Helper para firmar tokens (CORREGIDO FINALMENTE)
 const signToken = (id: string) => {
-    return jwt.sign(
-        { id }, 
-        process.env.JWT_SECRET || 'secret', 
-        { expiresIn: '30d' } as any // Forzamos a any para que se calle
-    );
+    // Forzamos a string para evitar dudas de TS
+    const secret = (process.env.JWT_SECRET || 'secreto_por_defecto') as jwt.Secret;
+    
+    // Creamos el objeto de opciones y lo forzamos a 'any' para evitar conflictos de sobrecarga
+    const options = {
+        expiresIn: process.env.JWT_EXPIRES_IN || '30d'
+    };
+
+    // @ts-ignore: Ignoramos errores de sobrecarga específicos de jwt
+    return jwt.sign({ id }, secret, options);
 };
 
-// 1. REGISTRO
+// 1. REGISTRO (Crea usuario PENDING_APPROVAL)
 export const register = async (req: Request, res: Response) => {
   try {
     const { name, surname, alias, email, password } = req.body;
@@ -32,8 +36,12 @@ export const register = async (req: Request, res: Response) => {
       status: 'PENDING_APPROVAL'
     });
 
-    console.log(`📧 [ADMIN]: Nuevo registro pendiente. ID: ${newUser._id}, Alias: ${newUser.alias}`);
-    res.status(201).json({ message: 'Registro recibido. Esperando aprobación.' });
+    console.log(`📧 [SISTEMA]: Enviando notificación al Admin...`);
+    
+    const adminEmail = process.env.ADMIN_EMAIL || "admin@localhost.com";
+    await sendAdminNotification(adminEmail, newUser.alias);
+
+    res.status(201).json({ message: 'Registro recibido. Se ha notificado al administrador.' });
 
   } catch (error) {
     console.error(error);
@@ -42,7 +50,6 @@ export const register = async (req: Request, res: Response) => {
 };
 
 // 2. LOGIN
-// Usamos 'any' en req para evitar problemas de tipado al limpiar el password
 export const login = async (req: any, res: Response) => {
     try {
       const { email, password } = req.body;
@@ -58,10 +65,7 @@ export const login = async (req: any, res: Response) => {
           return res.status(403).json({ message: `Tu cuenta no está activa. Estado: ${user.status}` });
       }
   
-      // Generamos Token (con conversión explícita a string)
       const token = signToken(user._id.toString());
-
-      // Limpiamos el password antes de enviar
       user.password = undefined;
       
       res.json({ message: "Login correcto", token, user });
@@ -80,13 +84,14 @@ export const approveUser = async (req: Request, res: Response) => {
     const user = await User.findByIdAndUpdate(userId, {
       status: 'WAITING_CODE',
       verificationCode: code
-    });
+    }, { new: true });
 
     if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
 
-    console.log(`📧 [USUARIO ${user.email}]: Tu código es: ${code}`); 
+    console.log(`📧 [SISTEMA]: Enviando código a ${user.email}...`); 
+    await sendVerificationEmail(user.email, code);
 
-    res.json({ message: 'Usuario aprobado. Código enviado.' });
+    res.json({ message: `Usuario aprobado. Email enviado a ${user.email}.` });
   } catch (error) {
     res.status(500).json({ message: 'Error aprobando usuario' });
   }
@@ -125,9 +130,10 @@ export const forgotPassword = async (req: Request, res: Response) => {
         user.resetPasswordExpires = new Date(Date.now() + 3600000); 
         await user.save();
 
-        console.log(`📧 [RESET PASSWORD]: Token para ${email}: ${resetToken}`);
+        console.log(`📧 [SISTEMA]: Enviando token a ${email}...`);
+        await sendResetPasswordEmail(user.email, resetToken);
 
-        res.json({ message: "Email de recuperación enviado (mira la consola)" });
+        res.json({ message: "Email de recuperación enviado." });
 
     } catch (error) {
         res.status(500).json({ message: "Error en forgot password" });
