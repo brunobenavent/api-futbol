@@ -1,4 +1,5 @@
 import puppeteer from 'puppeteer-extra';
+import { evaluateMatchImpact } from './GameService.js';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 // @ts-ignore
 import UserAgent from 'user-agents';
@@ -215,6 +216,12 @@ export class ScraperService {
         if (match && details.stadium) {
             await Team.findByIdAndUpdate(match.homeTeam, { stadium: details.stadium });
         }
+
+        if (match && match.status === 'FINISHED') {
+        // No usamos await para no bloquear el scraper, dejamos que procese en fondo
+        evaluateMatchImpact(match._id.toString()).catch(err => console.error("Error evaluando impacto:", err));
+    }
+        
 
     } catch (error) {
         console.error("❌ Error en detalle:", error);
