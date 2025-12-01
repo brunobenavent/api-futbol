@@ -2,6 +2,8 @@ import express, { Application } from 'express';
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './config/swagger.js';
 
+import cors from 'cors'; // <--- IMPORTAR
+
 // Importamos los enrutadores
 import matchRoutes from './routes/matchRoutes.js';
 import teamRoutes from './routes/teamRoutes.js';
@@ -10,7 +12,11 @@ import authRoutes from './routes/authRoutes.js'; // <--- NUEVO (Auth)
 import gameRoutes from './routes/gameRoutes.js';
 
 const app: Application = express();
-
+// 👇 AÑADE ESTO AL PRINCIPIO 👇
+app.use(cors({
+    origin: 'http://localhost:5173', // Permite peticiones desde tu frontend
+    credentials: true // Permite cookies/headers de autorización
+}));
 // Middleware para leer JSON en el body de las peticiones (Login, Registro, etc.)
 app.use(express.json());
 

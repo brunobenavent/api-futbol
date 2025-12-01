@@ -5,81 +5,55 @@ import User from '../models/User.js';
 import Match from '../models/Match.js';
 import { getActiveRoundNumber } from './MatchController.js'; 
 
-// HELPER: Verificar plazo (1h antes del primer partido)
+// HELPER: Verificar plazo
 const checkPredictionDeadline = async (seasonId: any, round: number): Promise<{ allowed: boolean, message?: string }> => {
     const firstMatch = await Match.findOne({ season: seasonId, round }).sort({ matchDate: 1 });
-    
     if (!firstMatch || !firstMatch.matchDate) return { allowed: true }; 
-
     const deadline = new Date(firstMatch.matchDate.getTime() - 60 * 60 * 1000);
-    const now = new Date();
-
-    if (now > deadline) {
-        return { 
-            allowed: false, 
-            message: `El plazo cerró a las ${deadline.toLocaleTimeString()} (1h antes del primer partido).` 
-        };
+    if (new Date() > deadline) {
+        return { allowed: false, message: `Plazo cerrado a las ${deadline.toLocaleTimeString()}.` };
     }
     return { allowed: true };
 };
 
-// --- 1. INICIAR JUEGO (MANUAL) ---
+// 1. INICIAR JUEGO
 export const startGame = async (req: Request, res: Response) => {
     try {
         const { gameId } = req.body;
         const game = await Game.findById(gameId);
-        
         if (!game) return res.status(404).json({ message: "Juego no encontrado" });
-        if (game.status !== 'OPEN') return res.status(400).json({ message: "El juego no está en estado OPEN." });
+        if (game.status !== 'OPEN') return res.status(400).json({ message: "El juego no está OPEN." });
 
-        // --- VALIDACIÓN NUEVA: MÍNIMO 20 JUGADORES ---
         const playerCount = await GamePlayer.countDocuments({ game: gameId });
-        
-        if (playerCount < 20) {
-            return res.status(400).json({ 
-                message: `No se puede iniciar el juego. Se necesitan al menos 20 jugadores (actuales: ${playerCount}).` 
-            });
-        }
+        if (playerCount < 20) return res.status(400).json({ message: `Mínimo 20 jugadores. Hay ${playerCount}.` });
 
         const currentRealRound = await getActiveRoundNumber();
-
-        // VALIDACIÓN: ¿Ha empezado ya esta jornada?
         const startedMatches = await Match.countDocuments({
-            season: game.season,
-            round: currentRealRound,
-            status: { $ne: 'SCHEDULED' }
+            season: game.season, round: currentRealRound, status: { $ne: 'SCHEDULED' }
         });
 
-        if (startedMatches > 0) {
-            return res.status(400).json({ 
-                message: `No se puede iniciar. La Jornada ${currentRealRound} ya ha comenzado.` 
-            });
-        }
+        if (startedMatches > 0) return res.status(400).json({ message: `Jornada ${currentRealRound} ya iniciada.` });
 
         game.status = 'IN_PROGRESS';
         game.currentRound = currentRealRound;
         await game.save();
-
-        res.json({ message: `Juego iniciado en la Jornada ${currentRealRound} con ${playerCount} jugadores. ¡Suerte!` });
-
-    } catch (error) {
-        res.status(500).json({ message: "Error iniciando juego", error });
-    }
+        res.json({ message: `Juego iniciado en J${currentRealRound}.` });
+    } catch (error) { res.status(500).json({ message: "Error iniciando", error }); }
 };
 
-// --- 2. UNIRSE A JUEGO ---
+// 2. UNIRSE A JUEGO
 export const joinGame = async (req: Request, res: Response) => {
   try {
     const { userId, gameId } = req.body;
     const user = await User.findById(userId);
     const game = await Game.findById(gameId);
 
-    if (!user || !game) return res.status(404).send("Usuario o Juego no encontrado");
-    if (game.status !== 'OPEN') return res.status(400).send("El juego ya ha comenzado.");
-    if (user.tokens < game.entryPrice) return res.status(400).send("No tienes suficientes tokens");
+    if (!user || !game) return res.status(404).send("Datos incorrectos");
+    if (game.status !== 'OPEN') return res.status(400).send("Juego ya comenzado.");
+    if (user.tokens < game.entryPrice) return res.status(400).send("Sin tokens suficientes.");
 
     const existingPlayer = await GamePlayer.findOne({ user: userId, game: gameId });
-    if (existingPlayer) return res.status(400).send("Ya estás inscrito.");
+    if (existingPlayer) return res.status(400).send("Ya inscrito.");
 
     user.tokens -= game.entryPrice;
     await user.save();
@@ -87,16 +61,46 @@ export const joinGame = async (req: Request, res: Response) => {
     await game.save();
 
     const count = await GamePlayer.countDocuments({ game: gameId });
-    
     await GamePlayer.create({
       user: userId, game: gameId, playerNumber: count + 1, usedTeams: []
     });
 
-    res.json({ message: `Inscrito correctamente. Jugador #${count + 1}` });
+    res.json({ message: `Inscrito correctamente.` });
   } catch (error) { res.status(500).json({ message: 'Error al unirse', error }); }
 };
 
-// --- 3. HACER PREDICCIÓN ---
+// 3. OBTENER DASHBOARD USUARIO (ARREGLADO)
+export const getUserDashboard = async (req: any, res: Response) => {
+    try {
+        const userId = req.user._id;
+        console.log(`🔍 Dashboard para: ${userId}`);
+
+        // Juegos donde participo
+        const myParticipations = await GamePlayer.find({ user: userId }).populate('game');
+        
+        // Filtramos por si populate falla (juego borrado)
+        const validParticipations = myParticipations.filter(p => p.game);
+
+        const myGames = validParticipations.map(p => ({
+            _id: p._id, 
+            isAlive: p.isAlive,
+            playerNumber: p.playerNumber,
+            game: p.game 
+        }));
+
+        // Juegos disponibles (OPEN y donde NO estoy)
+        const allOpenGames = await Game.find({ status: 'OPEN' });
+        const myGameIds = validParticipations.map(p => (p.game as any)._id.toString());
+        const availableGames = allOpenGames.filter(g => !myGameIds.includes(g._id.toString()));
+
+        res.json({ myGames, availableGames });
+    } catch (error) {
+        console.error("Error dashboard:", error);
+        res.status(500).json({ message: "Error cargando dashboard" });
+    }
+};
+
+// 4. HACER PREDICCIÓN
 export const makePick = async (req: Request, res: Response) => {
   try {
     const { userId, gameId, mainTeamId, backupTeamId, round } = req.body;
@@ -104,14 +108,11 @@ export const makePick = async (req: Request, res: Response) => {
     
     if (!game) return res.status(404).send("Juego no encontrado");
     if (game.status === 'FINISHED') return res.status(400).json({ message: "Juego finalizado." });
-    if (game.status === 'WAITING_RESURRECTION') return res.status(400).json({ message: "Juego en fase de resurrección." });
+    if (game.status === 'WAITING_RESURRECTION') return res.status(400).json({ message: "Fase resurrección." });
 
     const playerEntry = await GamePlayer.findOne({ user: userId, game: gameId });
     
-    if (round !== game.currentRound) {
-        return res.status(400).json({ message: `Debes pronosticar para la Jornada ${game.currentRound} del juego.` });
-    }
-
+    if (round !== game.currentRound) return res.status(400).json({ message: `Solo jornada ${game.currentRound}.` });
     if (!playerEntry || !playerEntry.isAlive) return res.status(400).send("Estás eliminado.");
 
     const deadline = await checkPredictionDeadline(game.season, round);
@@ -130,21 +131,18 @@ export const makePick = async (req: Request, res: Response) => {
 
     await playerEntry.save();
     res.json({ message: "Elección guardada." });
-
   } catch (error) { res.status(500).json({ message: 'Error al guardar', error }); }
 };
 
-// --- 4. MODIFICAR PREDICCIÓN ---
+// 5. MODIFICAR
 export const updatePick = async (req: Request, res: Response) => {
   try {
     const { userId, gameId, mainTeamId, backupTeamId, round } = req.body;
     const game = await Game.findById(gameId);
     if (!game) return res.status(404).send("Juego no encontrado");
-
-    if (game.status === 'FINISHED') return res.status(400).json({ message: "El juego ha terminado." });
+    if (game.status === 'FINISHED') return res.status(400).json({ message: "Juego finalizado." });
 
     const playerEntry = await GamePlayer.findOne({ user: userId, game: gameId });
-    
     if (!playerEntry || !playerEntry.isAlive) return res.status(400).send("Estás eliminado.");
     if (round !== game.currentRound) return res.status(400).json({ message: "Solo jornada actual." });
 
@@ -152,7 +150,7 @@ export const updatePick = async (req: Request, res: Response) => {
     if (!deadline.allowed) return res.status(403).json({ message: deadline.message });
 
     const existingPickIndex = playerEntry.picks.findIndex(p => p.round === round);
-    if (existingPickIndex === -1) return res.status(404).send("No tienes predicción para editar.");
+    if (existingPickIndex === -1) return res.status(404).send("No hay predicción.");
 
     const usedTeamsStrings = playerEntry.usedTeams.map(id => id.toString());
     if (usedTeamsStrings.includes(mainTeamId) || usedTeamsStrings.includes(backupTeamId)) {
@@ -166,22 +164,19 @@ export const updatePick = async (req: Request, res: Response) => {
     playerEntry.picks[existingPickIndex].usedBackup = false;
 
     await playerEntry.save();
-    res.json({ message: "Predicción modificada correctamente." });
-
+    res.json({ message: "Modificado correctamente." });
   } catch (error) { res.status(500).json({ message: 'Error al modificar', error }); }
 };
 
-// --- 5. ELIMINAR PREDICCIÓN ---
+// 6. ELIMINAR
 export const deletePick = async (req: Request, res: Response) => {
   try {
     const { userId, gameId, round } = req.body;
     const game = await Game.findById(gameId);
     if (!game) return res.status(404).send("Juego no encontrado");
-    
-    if (game.status === 'FINISHED') return res.status(400).json({ message: "El juego ha terminado." });
+    if (game.status === 'FINISHED') return res.status(400).json({ message: "Finalizado." });
 
     const playerEntry = await GamePlayer.findOne({ user: userId, game: gameId });
-
     if (!playerEntry || !playerEntry.isAlive) return res.status(400).send("Acción no permitida.");
     if (round !== game.currentRound) return res.status(400).json({ message: "Solo jornada actual." });
 
@@ -190,25 +185,22 @@ export const deletePick = async (req: Request, res: Response) => {
 
     const initialLength = playerEntry.picks.length;
     playerEntry.picks = playerEntry.picks.filter(p => p.round !== round);
-
     if (playerEntry.picks.length === initialLength) return res.status(404).send("No había predicción.");
 
     await playerEntry.save();
-    res.json({ message: "Predicción eliminada." });
-
+    res.json({ message: "Eliminada." });
   } catch (error) { res.status(500).json({ message: 'Error al eliminar', error }); }
 };
 
-// --- 6. RESUCITAR JUGADOR (Mejorado) ---
+// 7. RESUCITAR
 export const resurrectPlayer = async (req: any, res: Response) => {
     try {
         const { userId, gameId } = req.body;
-        const requester = req.user; // Usuario que hace la petición (del token)
+        const requester = req.user;
         const RESURRECTION_PRICE = 10;
 
-        // Seguridad: Solo el propio usuario o un Admin pueden hacer esto
         if (requester.role !== 'ADMIN' && requester._id.toString() !== userId) {
-            return res.status(403).json({ message: "No tienes permiso para resucitar a este jugador." });
+            return res.status(403).json({ message: "No tienes permiso." });
         }
 
         const game = await Game.findById(gameId);
@@ -216,71 +208,46 @@ export const resurrectPlayer = async (req: any, res: Response) => {
         const playerEntry = await GamePlayer.findOne({ user: userId, game: gameId });
 
         if (!game || !user || !playerEntry) return res.status(404).json({ message: "Datos no encontrados" });
+        if (game.status !== 'WAITING_RESURRECTION') return res.status(400).json({ message: "Juego no admite resurrección." });
+        if (user.tokens < RESURRECTION_PRICE) return res.status(400).json({ message: "Faltan tokens." });
 
-        // Regla 1: Solo si venimos de un "apocalipsis" (sin ganadores)
-        if (game.status !== 'WAITING_RESURRECTION') {
-            return res.status(400).json({ message: "El juego no está en fase de resurrección (quizás hubo ganadores o aún no terminó)." });
-        }
-
-        // Regla 2: Coste de 10 tokens
-        if (user.tokens < RESURRECTION_PRICE) {
-            return res.status(400).json({ message: `Saldo insuficiente. Necesitas ${RESURRECTION_PRICE} tokens.` });
-        }
-
-        // Ejecutar cobro y resurrección
         user.tokens -= RESURRECTION_PRICE;
         await user.save();
-
         game.pot += RESURRECTION_PRICE;
         await game.save();
 
         playerEntry.isAlive = true;
-        playerEntry.usedTeams = []; // Reset de equipos usados, ¡nueva vida!
-        // Opcional: Marcar en el historial que resucitó
-        // playerEntry.picks.push({ round: game.currentRound, result: 'RESURRECTED' } as any); 
-        
+        playerEntry.usedTeams = []; 
         await playerEntry.save();
 
-        res.json({ 
-            message: "¡Has resucitado! Tus equipos se han reseteado y sigues en el juego.", 
-            tokensRestantes: user.tokens 
-        });
-
-    } catch (error) {
-        res.status(500).json({ message: "Error en resurrección", error });
-    }
+        res.json({ message: "¡Resucitado!", tokensRestantes: user.tokens });
+    } catch (error) { res.status(500).json({ message: "Error resurrección", error }); }
 };
 
-// --- 7. CERRAR FASE DE RESURRECCIÓN ---
+// 8. CERRAR RESURRECCIÓN
 export const closeResurrectionRound = async (req: Request, res: Response) => {
     try {
         const { gameId } = req.body;
         const game = await Game.findById(gameId);
-        
         if (!game) return res.status(404).send("Juego no encontrado");
-        if (game.status !== 'WAITING_RESURRECTION') return res.status(400).send("No espera resurrecciones.");
+        if (game.status !== 'WAITING_RESURRECTION') return res.status(400).send("Estado incorrecto.");
 
         const nextRealRound = await getActiveRoundNumber();
-        if (game.currentRound < nextRealRound) {
-            game.currentRound = nextRealRound;
-        } else {
-             game.currentRound++;
-        }
+        if (game.currentRound < nextRealRound) game.currentRound = nextRealRound;
+        else game.currentRound++;
 
         game.status = 'IN_PROGRESS';
         await game.save();
-
-        res.json({ message: `Fase cerrada. Juego continúa en J${game.currentRound}.` });
+        res.json({ message: `Fase cerrada. Juego en J${game.currentRound}.` });
     } catch (error) { res.status(500).json({ message: "Error cerrando fase", error }); }
 }
 
-// --- 8. EVALUAR JORNADA ---
+// 9. EVALUAR JORNADA
 export const evaluateRound = async (req: Request, res: Response) => {
     const { gameId, round } = req.body; 
     try {
         const game = await Game.findById(gameId);
         if (!game) return res.status(404).send("Juego no encontrado.");
-        if (game.status === 'FINISHED') return res.status(400).json({ message: "Juego finalizado." });
 
         const pendingMatchesCount = await Match.countDocuments({
             season: game.season, round: round, status: { $in: ['SCHEDULED', 'LIVE'] }
@@ -324,8 +291,7 @@ export const evaluateRound = async (req: Request, res: Response) => {
                 if (pendingMatchesCount === 0) {
                     pick.result = 'VOID';
                     await player.save();
-                    winnersCount++;
-                    remainingPlayers.push(player._id);
+                    winnersCount++; remainingPlayers.push(player._id);
                 }
                 continue; 
             }
@@ -364,6 +330,5 @@ export const evaluateRound = async (req: Request, res: Response) => {
         }
         
         res.json({ message: `Evaluación parcial.`, stats: { eliminated: eliminatedCount } });
-
     } catch (error) { res.status(500).send("Error evaluando"); }
 }

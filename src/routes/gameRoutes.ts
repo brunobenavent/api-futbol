@@ -5,6 +5,7 @@ import {
 } from '../controllers/GameLogicController.js';
 import { getGameDetails } from '../controllers/AdminController.js'; 
 import { protect, restrictTo } from '../middlewares/auth.js';
+import { getUserDashboard } from '../controllers/GameLogicController.js';
 
 const router = Router();
 
@@ -22,5 +23,8 @@ router.post('/close-resurrection', protect, restrictTo('ADMIN'), closeResurrecti
 
 // --- INFO ---
 router.get('/:id', protect, getGameDetails); 
+
+
+router.get('/dashboard', protect, getUserDashboard);
 
 export default router;
