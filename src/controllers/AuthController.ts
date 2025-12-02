@@ -2,14 +2,13 @@ import { Request, Response } from 'express';
 import User from '../models/User.js';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
-import jwt, { Secret, SignOptions } from 'jsonwebtoken';
-import { sendVerificationEmail, sendResetPasswordEmail, sendAdminNotification } from '../services/EmailService.js';
+import jwt, { Secret } from 'jsonwebtoken';
+// Importamos los servicios de email. Asegúrate de que EmailService.ts exista y exporte estas funciones.
+import { sendVerificationEmail, sendResetPasswordEmail, sendAdminNotification, sendEmail } from '../services/EmailService.js';
 import dotenv from 'dotenv';
 
-// Aseguramos carga de variables de entorno
 dotenv.config();
 
-// Helper para firmar tokens
 const signToken = (id: string) => {
     const secret = (process.env.JWT_SECRET || 'secreto_por_defecto') as Secret;
     const options = {
@@ -27,6 +26,11 @@ export const register = async (req: Request, res: Response) => {
     if (!name || !surname || !alias || !email || !password) {
         return res.status(400).json({ message: "Faltan datos obligatorios" });
     }
+
+    // Validación extra de formato de email
+    if (!email.includes('@')) {
+        return res.status(400).json({ message: "El formato del email no es válido." });
+    }
     
     const existingUser = await User.findOne({ $or: [{ email }, { alias }] });
     if (existingUser) return res.status(400).json({ message: "Email o Alias ya en uso" });
@@ -36,10 +40,17 @@ export const register = async (req: Request, res: Response) => {
       status: 'PENDING_APPROVAL'
     });
 
-    console.log(`📧 [SISTEMA]: Enviando notificación al Admin...`);
+    console.log(`📧 [SISTEMA]: Usuario registrado: ${newUser.alias}. Intentando notificar al Admin...`);
     
-    const adminEmail = process.env.ADMIN_EMAIL || "admin@localhost.com";
-    await sendAdminNotification(adminEmail, newUser.alias);
+    // ENVÍO DE NOTIFICACIÓN AL ADMIN
+    const adminEmail = process.env.ADMIN_EMAIL;
+    if (adminEmail && adminEmail.includes('@')) {
+        const emailSent = await sendAdminNotification(adminEmail, newUser.alias);
+        if (emailSent) console.log("✅ Notificación enviada al Admin.");
+        else console.error("❌ Falló el envío al Admin.");
+    } else {
+        console.warn("⚠️ No hay ADMIN_EMAIL válido en .env, no se envió notificación.");
+    }
 
     res.status(201).json({ message: 'Registro recibido. Se ha notificado al administrador.' });
 
@@ -49,12 +60,10 @@ export const register = async (req: Request, res: Response) => {
   }
 };
 
-// 2. LOGIN (MEJORADO: Reenvío automático)
+// 2. LOGIN
 export const login = async (req: any, res: Response) => {
     try {
       const { email, password } = req.body;
-  
-      // Pedimos password explícitamente
       const user = await User.findOne({ email }).select('+password');
       
       if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
@@ -62,11 +71,14 @@ export const login = async (req: any, res: Response) => {
       const isMatch = await bcrypt.compare(password, user.password || '');
       if (!isMatch) return res.status(400).json({ message: "Contraseña incorrecta" });
   
-      // --- LÓGICA DE ESTADO ---
       if (user.status !== 'ACTIVE') {
-          
-          // CASO ESPECIAL: Si está esperando código, se lo reenviamos automáticamente
+          // Reenvío automático si está esperando código
           if (user.status === 'WAITING_CODE') {
+              // Verificamos email antes de reenviar
+              if (!user.email || !user.email.includes('@')) {
+                  return res.status(403).json({ message: "Tu cuenta está pendiente pero el email registrado es inválido. Contacta al soporte." });
+              }
+
               const newCode = Math.floor(100000 + Math.random() * 900000).toString();
               user.verificationCode = newCode;
               await user.save();
@@ -78,12 +90,9 @@ export const login = async (req: any, res: Response) => {
                   message: "Tu cuenta no está verificada. Te acabamos de enviar un NUEVO código a tu correo." 
               });
           }
-
-          // Otros estados (Rechazado o Pendiente de Admin)
           return res.status(403).json({ message: `Acceso denegado. Estado de cuenta: ${user.status}` });
       }
   
-      // Si está activo, generamos token
       const token = signToken(user._id.toString());
       user.password = undefined;
       
@@ -94,10 +103,21 @@ export const login = async (req: any, res: Response) => {
     }
 };
 
-// 3. APROBAR USUARIO
+// 3. APROBAR USUARIO (Admin)
 export const approveUser = async (req: Request, res: Response) => {
   try {
     const { userId } = req.body; 
+    
+    // Primero buscamos al usuario para validar su email ANTES de generar código
+    const userCheck = await User.findById(userId);
+    if (!userCheck) return res.status(404).json({ message: "Usuario no encontrado" });
+
+    if (!userCheck.email || !userCheck.email.includes('@')) {
+        console.error(`❌ Error Crítico: El usuario ${userCheck.alias} tiene un email inválido: ${userCheck.email}`);
+        return res.status(400).json({ message: `No se puede aprobar: El email '${userCheck.email}' no es válido.` });
+    }
+
+    // Generar código de 6 dígitos
     const code = Math.floor(100000 + Math.random() * 900000).toString(); 
 
     const user = await User.findByIdAndUpdate(userId, {
@@ -105,34 +125,60 @@ export const approveUser = async (req: Request, res: Response) => {
       verificationCode: code
     }, { new: true });
 
-    if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
+    if (!user) return res.status(404).json({ message: "Usuario no encontrado tras actualización." }); // TypeScript check
 
-    console.log(`📧 [SISTEMA]: Enviando código a ${user.email}...`); 
-    await sendVerificationEmail(user.email, code);
+    console.log(`📧 [SISTEMA]: Aprobando usuario ${user.alias}. Enviando código ${code} a ${user.email}...`); 
+    
+    // ENVÍO DE CÓDIGO AL USUARIO
+    try {
+        const emailSent = await sendVerificationEmail(user.email, code);
+        if (!emailSent) {
+            console.error("❌ SendGrid/Nodemailer devolvió false.");
+            return res.status(500).json({ message: "Usuario actualizado a WAITING_CODE, pero falló el envío del email." });
+        }
+        console.log("✅ Código enviado correctamente.");
+    } catch (emailErr) {
+        console.error("❌ Excepción enviando email:", emailErr);
+        return res.status(500).json({ message: "Error técnico enviando email." });
+    }
 
-    res.json({ message: `Usuario aprobado. Email enviado a ${user.email}.` });
+    res.json({ message: `Usuario aprobado. Email con código enviado a ${user.email}.` });
   } catch (error) {
+    console.error(error);
     res.status(500).json({ message: 'Error aprobando usuario' });
   }
 };
 
-// 4. VERIFICAR CÓDIGO (Activa cuenta con 0 tokens)
+// 4. VERIFICAR CÓDIGO
 export const verifyCode = async (req: Request, res: Response) => {
   try {
     const { email, code } = req.body;
     const user = await User.findOne({ email, status: 'WAITING_CODE' }).select('+verificationCode');
 
     if (!user || user.verificationCode !== code) {
-        return res.status(400).json({ message: 'Código incorrecto' });
+        return res.status(400).json({ message: 'Código incorrecto o usuario no espera verificación.' });
     }
 
     user.status = 'ACTIVE';
     user.verificationCode = undefined; 
-    // user.tokens = 100; <--- ELIMINADO: Empiezan con 0 (o lo que tenga por defecto el modelo)
-    
     await user.save();
 
-    res.json({ message: '¡Cuenta activada! Tienes 0 tokens. Contacta al admin para recargar.', user });
+    console.log(`📧 [SISTEMA]: Usuario ${user.alias} verificado. Enviando email de bienvenida...`);
+    
+    // ENVÍO DE EMAIL DE BIENVENIDA (Confirmación de activación)
+    if (user.email && user.email.includes('@')) {
+        const htmlBienvenida = `
+          <div style="font-family: Arial, sans-serif; padding: 20px;">
+            <h2 style="color: #27ae60;">¡Cuenta Activada! 🚀</h2>
+            <p>Hola <b>${user.alias}</b>,</p>
+            <p>Tu código ha sido verificado correctamente. Ya tienes acceso completo a la API de Fútbol y al Juego Survivor.</p>
+            <p><a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/login">Iniciar Sesión</a></p>
+          </div>
+        `;
+        await sendEmail(user.email, "¡Bienvenido! Tu cuenta está activa", htmlBienvenida);
+    }
+
+    res.json({ message: '¡Cuenta activada! Ya puedes iniciar sesión.', user });
   } catch (error) {
     res.status(500).json({ message: 'Error verificando' });
   }
@@ -147,18 +193,31 @@ export const resendVerificationCode = async (req: Request, res: Response) => {
     const user = await User.findOne({ email });
     if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
 
-    if (user.status !== 'WAITING_CODE') return res.status(400).json({ message: "No se puede enviar código (Cuenta activa o pendiente)." });
+    if (user.status !== 'WAITING_CODE') return res.status(400).json({ message: "Cuenta no está en espera de código." });
+
+    // Validación de email antes de reenviar
+    if (!user.email || !user.email.includes('@')) {
+        return res.status(400).json({ message: "Email inválido en base de datos." });
+    }
 
     const newCode = Math.floor(100000 + Math.random() * 900000).toString();
     user.verificationCode = newCode;
     await user.save();
 
-    console.log(`📧 [SISTEMA]: Reenviando código a ${user.email}...`); 
-    await sendVerificationEmail(user.email, newCode);
+    console.log(`📧 [SISTEMA]: Solicitud manual. Reenviando código a ${user.email}...`); 
+    
+    // ENVÍO DE CÓDIGO
+    const emailSent = await sendVerificationEmail(user.email, newCode);
 
-    res.json({ message: "Nuevo código enviado." });
+    if (!emailSent) {
+        console.error("❌ Falló el reenvío del email.");
+        return res.status(500).json({ message: "Error al enviar el correo." });
+    }
+
+    res.json({ message: "Nuevo código enviado a tu correo." });
 
   } catch (error) {
+    console.error(error);
     res.status(500).json({ message: "Error al reenviar código" });
   }
 };
@@ -175,10 +234,10 @@ export const forgotPassword = async (req: Request, res: Response) => {
         user.resetPasswordExpires = new Date(Date.now() + 3600000); 
         await user.save();
 
-        console.log(`📧 [SISTEMA]: Enviando token a ${email}...`);
+        console.log(`📧 [SISTEMA]: Enviando token de recuperación a ${email}...`);
         await sendResetPasswordEmail(user.email, resetToken);
 
-        res.json({ message: "Email de recuperación enviado." });
+        res.json({ message: "Si el correo existe, se ha enviado un token de recuperación." });
 
     } catch (error) {
         res.status(500).json({ message: "Error en forgot password" });
@@ -210,7 +269,7 @@ export const resetPassword = async (req: Request, res: Response) => {
     }
 };
 
-// 8. PERFIL (PROTEGIDO)
+// 8. PERFIL
 export const getProfile = async (req: any, res: Response) => {
     try {
         const { id } = req.params;
@@ -230,31 +289,17 @@ export const getProfile = async (req: any, res: Response) => {
         res.status(500).json({ message: "Error obteniendo perfil" });
     }
 };
-// ... (imports y otras funciones)
 
 // 9. ACTUALIZAR AVATAR
 export const updateAvatar = async (req: any, res: Response) => {
     try {
-        // El usuario viene del middleware 'protect'
         const userId = req.user._id;
         const { avatar } = req.body;
 
-        if (!avatar) {
-            return res.status(400).json({ message: "Se requiere una URL de avatar." });
-        }
+        if (!avatar) return res.status(400).json({ message: "Se requiere URL de avatar." });
 
-        // Actualizamos solo el campo avatar
-        const user = await User.findByIdAndUpdate(
-            userId, 
-            { avatar: avatar },
-            { new: true } // Devolver el usuario actualizado
-        );
-
-        res.json({ 
-            message: "Avatar actualizado correctamente.", 
-            user 
-        });
-
+        const user = await User.findByIdAndUpdate(userId, { avatar }, { new: true });
+        res.json({ message: "Avatar actualizado.", user });
     } catch (error) {
         res.status(500).json({ message: "Error actualizando avatar" });
     }

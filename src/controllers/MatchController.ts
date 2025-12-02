@@ -14,7 +14,7 @@ const getAutoSeasonYear = (): string => {
     return now.getFullYear().toString();
 };
 
-// --- HELPER EXPORTADO (MEJORADO PARA EVITAR JORNADA 0) ---
+// --- HELPER EXPORTADO (LÓGICA COMBINADA ROBUSTA) ---
 export const getActiveRoundNumber = async (): Promise<number> => {
     const autoSeason = getAutoSeasonYear();
     const seasonDoc = await Season.findOne({ year: autoSeason });
@@ -22,19 +22,33 @@ export const getActiveRoundNumber = async (): Promise<number> => {
     if (!seasonDoc) return 1;
 
     const now = new Date();
+    // Margen de seguridad: 6 horas atrás para incluir partidos que estén LIVE ahora mismo
+    const bufferDate = new Date(now.getTime() - 6 * 60 * 60 * 1000);
 
-    // 1. Buscamos el primer partido futuro (o actual)
-    const nextMatch = await Match.findOne({
+    // 1. Buscamos partidos PENDIENTES o EN JUEGO que sean FUTUROS o RECIENTES
+    const nextMatches = await Match.find({
         season: seasonDoc._id,
-        matchDate: { $gte: now } 
-    }).sort({ matchDate: 1 }).select('round'); 
+        status: { $in: ['SCHEDULED', 'LIVE'] }, 
+        matchDate: { 
+            $exists: true, 
+            $gte: bufferDate // <--- FILTRO CLAVE: Ignora la J1 de agosto
+        }
+    })
+    .sort({ matchDate: 1 }) // Ordenamos por fecha (aparecerá primero J19 del 2-dic)
+    .limit(30) // Tomamos un lote grande (3 jornadas aprox) para analizar el contexto
+    .select('round');
 
-    if (nextMatch) return nextMatch.round;
+    if (nextMatches.length > 0) {
+        // 2. "Voto democrático": De los próximos partidos reales, ¿cuál es la jornada más baja?
+        // Esto detectará que aunque la J19 es mañana, la J15 también está en la lista pendiente.
+        const rounds = nextMatches.map(m => m.round);
+        return Math.min(...rounds); // Devolverá 15
+    }
 
-    // 2. Si no hay futuro (final de temporada), buscamos el último jugado
-    // ESTO ARREGLA EL "JORNADA 0"
+    // 3. Si no hay partidos futuros (fin de temporada), devolvemos la última jugada
     const lastMatch = await Match.findOne({
-        season: seasonDoc._id
+        season: seasonDoc._id,
+        status: 'FINISHED'
     }).sort({ matchDate: -1 }).select('round');
 
     return lastMatch ? lastMatch.round : 1;
@@ -86,7 +100,7 @@ export const getCurrentRound = async (req: Request, res: Response) => {
     
     if (!seasonDoc) return res.status(404).json({ message: "Temporada no iniciada", currentRound: 1, matches: [] });
 
-    // Usamos el helper mejorado
+    // Usamos el helper corregido
     const targetRound = await getActiveRoundNumber();
 
     const matches = await Match.find({
@@ -137,10 +151,16 @@ export const hydrateRound = async (req: Request, res: Response) => {
 
     res.send(`🚀 Hidratando J${round}.`);
     (async () => {
+        // --- LOG DE INICIO AGREGADO ---
+        console.log(`🚀 [MANUAL] Iniciando hidratación de la Jornada ${roundNumber}...`);
+        
         for (const match of matches) {
             await scraper.scrapeMatchDetail(match.matchUrl);
             await new Promise(r => setTimeout(r, 2000));
         }
+
+        // --- LOG DE FINALIZACIÓN AGREGADO ---
+        console.log(`✅ [MANUAL] Hidratación de la Jornada ${roundNumber} completada.`);
     })();
   } catch (error) { if (!res.headersSent) res.status(500).send("Error"); }
 };
