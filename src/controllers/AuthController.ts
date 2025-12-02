@@ -4,6 +4,8 @@ import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import jwt, { Secret } from 'jsonwebtoken';
 import { sendVerificationEmail, sendResetPasswordEmail, sendAdminNotification, sendEmail } from '../services/EmailService.js';
+// Importamos el nuevo servicio de Cloudinary
+import { uploadImageBuffer } from '../services/CloudinaryService.js'; 
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -215,11 +217,7 @@ export const updateAvatar = async (req: any, res: Response) => {
     } catch (error) { res.status(500).json({ message: "Error" }); }
 };
 
-// ==========================================
-// NUEVAS FUNCIONALIDADES PARA PERFIL
-// ==========================================
-
-// 10. ACTUALIZAR PERFIL (Nombre, Alias, Email, Avatar)
+// 10. ACTUALIZAR PERFIL
 export const updateProfile = async (req: any, res: Response) => {
     try {
         const { name, surname, alias, email, avatar } = req.body;
@@ -252,21 +250,18 @@ export const updateProfile = async (req: any, res: Response) => {
     }
 };
 
-// 11. CAMBIAR CONTRASEÑA (Estando logueado)
+// 11. CAMBIAR CONTRASEÑA
 export const changePassword = async (req: any, res: Response) => {
     try {
         const { currentPassword, newPassword } = req.body;
         const userId = req.user._id;
 
-        // 1. Obtener usuario con password
         const user = await User.findById(userId).select('+password');
         if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
 
-        // 2. Verificar contraseña actual
         const isMatch = await bcrypt.compare(currentPassword, user.password || '');
         if (!isMatch) return res.status(400).json({ message: "La contraseña actual es incorrecta." });
 
-        // 3. Guardar nueva (El middleware 'pre save' del modelo User hará el hash automáticamente si se modifica 'password')
         user.password = newPassword;
         await user.save();
 
@@ -274,5 +269,25 @@ export const changePassword = async (req: any, res: Response) => {
     } catch (error) {
         console.error(error);
         res.status(500).json({ message: "Error cambiando contraseña." });
+    }
+};
+
+// 12. SUBIR AVATAR (CLOUDINARY)
+// Se asume que la ruta usa multer para dejar el archivo en req.file
+export const uploadUserAvatar = async (req: any, res: Response) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ message: "No se ha subido ningún archivo." });
+        }
+
+        const userId = req.user._id;
+        const imageUrl = await uploadImageBuffer(req.file.buffer, 'avatars');
+
+        const user = await User.findByIdAndUpdate(userId, { avatar: imageUrl }, { new: true });
+
+        res.json({ message: "Imagen subida y avatar actualizado.", avatar: imageUrl, user });
+    } catch (error) {
+        console.error("Error subiendo avatar:", error);
+        res.status(500).json({ message: "Error al subir la imagen a Cloudinary." });
     }
 };
