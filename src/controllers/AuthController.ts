@@ -3,7 +3,6 @@ import User from '../models/User.js';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import jwt, { Secret } from 'jsonwebtoken';
-// Importamos los servicios de email. Asegúrate de que EmailService.ts exista y exporte estas funciones.
 import { sendVerificationEmail, sendResetPasswordEmail, sendAdminNotification, sendEmail } from '../services/EmailService.js';
 import dotenv from 'dotenv';
 
@@ -27,35 +26,26 @@ export const register = async (req: Request, res: Response) => {
         return res.status(400).json({ message: "Faltan datos obligatorios" });
     }
 
-    // Validación extra de formato de email
-    if (!email.includes('@')) {
-        return res.status(400).json({ message: "El formato del email no es válido." });
-    }
+    const emailLower = email.toLowerCase().trim();
+    if (!emailLower.includes('@')) return res.status(400).json({ message: "Email inválido." });
     
-    const existingUser = await User.findOne({ $or: [{ email }, { alias }] });
+    const existingUser = await User.findOne({ $or: [{ email: emailLower }, { alias }] });
     if (existingUser) return res.status(400).json({ message: "Email o Alias ya en uso" });
 
     const newUser = await User.create({
-      name, surname, alias, email, password, 
-      status: 'PENDING_APPROVAL'
+      name, surname, alias, email: emailLower, password, status: 'PENDING_APPROVAL'
     });
 
-    console.log(`📧 [SISTEMA]: Usuario registrado: ${newUser.alias}. Intentando notificar al Admin...`);
+    console.log(`📧 [SISTEMA]: Usuario registrado: ${newUser.alias}. Notificando Admin...`);
     
-    // ENVÍO DE NOTIFICACIÓN AL ADMIN
     const adminEmail = process.env.ADMIN_EMAIL;
     if (adminEmail && adminEmail.includes('@')) {
-        const emailSent = await sendAdminNotification(adminEmail, newUser.alias);
-        if (emailSent) console.log("✅ Notificación enviada al Admin.");
-        else console.error("❌ Falló el envío al Admin.");
-    } else {
-        console.warn("⚠️ No hay ADMIN_EMAIL válido en .env, no se envió notificación.");
+        await sendAdminNotification(adminEmail, newUser.alias);
     }
 
-    res.status(201).json({ message: 'Registro recibido. Se ha notificado al administrador.' });
+    res.status(201).json({ message: 'Registro recibido. Espera aprobación del administrador.' });
 
   } catch (error) {
-    console.error(error);
     res.status(500).json({ message: 'Error al registrar' });
   }
 };
@@ -64,7 +54,10 @@ export const register = async (req: Request, res: Response) => {
 export const login = async (req: any, res: Response) => {
     try {
       const { email, password } = req.body;
-      const user = await User.findOne({ email }).select('+password');
+      if (!email || !password) return res.status(400).json({ message: "Email y contraseña requeridos" });
+
+      const emailLower = email.toLowerCase().trim();
+      const user = await User.findOne({ email: emailLower }).select('+password');
       
       if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
   
@@ -72,25 +65,14 @@ export const login = async (req: any, res: Response) => {
       if (!isMatch) return res.status(400).json({ message: "Contraseña incorrecta" });
   
       if (user.status !== 'ACTIVE') {
-          // Reenvío automático si está esperando código
           if (user.status === 'WAITING_CODE') {
-              // Verificamos email antes de reenviar
-              if (!user.email || !user.email.includes('@')) {
-                  return res.status(403).json({ message: "Tu cuenta está pendiente pero el email registrado es inválido. Contacta al soporte." });
-              }
-
               const newCode = Math.floor(100000 + Math.random() * 900000).toString();
               user.verificationCode = newCode;
               await user.save();
-              
-              console.log(`📧 [SISTEMA]: Reenviando código automático a ${user.email}...`);
               await sendVerificationEmail(user.email, newCode);
-
-              return res.status(403).json({ 
-                  message: "Tu cuenta no está verificada. Te acabamos de enviar un NUEVO código a tu correo." 
-              });
+              return res.status(403).json({ message: "Cuenta no verificada. Nuevo código enviado." });
           }
-          return res.status(403).json({ message: `Acceso denegado. Estado de cuenta: ${user.status}` });
+          return res.status(403).json({ message: `Acceso denegado. Estado: ${user.status}` });
       }
   
       const token = signToken(user._id.toString());
@@ -103,48 +85,26 @@ export const login = async (req: any, res: Response) => {
     }
 };
 
-// 3. APROBAR USUARIO (Admin)
+// 3. APROBAR USUARIO
 export const approveUser = async (req: Request, res: Response) => {
   try {
     const { userId } = req.body; 
-    
-    // Primero buscamos al usuario para validar su email ANTES de generar código
     const userCheck = await User.findById(userId);
     if (!userCheck) return res.status(404).json({ message: "Usuario no encontrado" });
 
     if (!userCheck.email || !userCheck.email.includes('@')) {
-        console.error(`❌ Error Crítico: El usuario ${userCheck.alias} tiene un email inválido: ${userCheck.email}`);
-        return res.status(400).json({ message: `No se puede aprobar: El email '${userCheck.email}' no es válido.` });
+        return res.status(400).json({ message: "Email de usuario inválido." });
     }
 
-    // Generar código de 6 dígitos
     const code = Math.floor(100000 + Math.random() * 900000).toString(); 
-
     const user = await User.findByIdAndUpdate(userId, {
-      status: 'WAITING_CODE',
-      verificationCode: code
+      status: 'WAITING_CODE', verificationCode: code
     }, { new: true });
 
-    if (!user) return res.status(404).json({ message: "Usuario no encontrado tras actualización." }); // TypeScript check
+    if (user) await sendVerificationEmail(user.email, code);
 
-    console.log(`📧 [SISTEMA]: Aprobando usuario ${user.alias}. Enviando código ${code} a ${user.email}...`); 
-    
-    // ENVÍO DE CÓDIGO AL USUARIO
-    try {
-        const emailSent = await sendVerificationEmail(user.email, code);
-        if (!emailSent) {
-            console.error("❌ SendGrid/Nodemailer devolvió false.");
-            return res.status(500).json({ message: "Usuario actualizado a WAITING_CODE, pero falló el envío del email." });
-        }
-        console.log("✅ Código enviado correctamente.");
-    } catch (emailErr) {
-        console.error("❌ Excepción enviando email:", emailErr);
-        return res.status(500).json({ message: "Error técnico enviando email." });
-    }
-
-    res.json({ message: `Usuario aprobado. Email con código enviado a ${user.email}.` });
+    res.json({ message: `Usuario aprobado. Código enviado.` });
   } catch (error) {
-    console.error(error);
     res.status(500).json({ message: 'Error aprobando usuario' });
   }
 };
@@ -153,72 +113,44 @@ export const approveUser = async (req: Request, res: Response) => {
 export const verifyCode = async (req: Request, res: Response) => {
   try {
     const { email, code } = req.body;
-    const user = await User.findOne({ email, status: 'WAITING_CODE' }).select('+verificationCode');
+    const emailLower = email.toLowerCase().trim();
+    const user = await User.findOne({ email: emailLower, status: 'WAITING_CODE' }).select('+verificationCode');
 
     if (!user || user.verificationCode !== code) {
-        return res.status(400).json({ message: 'Código incorrecto o usuario no espera verificación.' });
+        return res.status(400).json({ message: 'Código incorrecto.' });
     }
 
     user.status = 'ACTIVE';
     user.verificationCode = undefined; 
     await user.save();
 
-    console.log(`📧 [SISTEMA]: Usuario ${user.alias} verificado. Enviando email de bienvenida...`);
-    
-    // ENVÍO DE EMAIL DE BIENVENIDA (Confirmación de activación)
-    if (user.email && user.email.includes('@')) {
-        const htmlBienvenida = `
-          <div style="font-family: Arial, sans-serif; padding: 20px;">
-            <h2 style="color: #27ae60;">¡Cuenta Activada! 🚀</h2>
-            <p>Hola <b>${user.alias}</b>,</p>
-            <p>Tu código ha sido verificado correctamente. Ya tienes acceso completo a la API de Fútbol y al Juego Survivor.</p>
-            <p><a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/login">Iniciar Sesión</a></p>
-          </div>
-        `;
-        await sendEmail(user.email, "¡Bienvenido! Tu cuenta está activa", htmlBienvenida);
+    if (user.email.includes('@')) {
+        await sendEmail(user.email, "¡Cuenta Activada!", "<h1>Bienvenido</h1><p>Tu cuenta ha sido activada.</p>");
     }
 
-    res.json({ message: '¡Cuenta activada! Ya puedes iniciar sesión.', user });
+    res.json({ message: '¡Cuenta activada!', user });
   } catch (error) {
     res.status(500).json({ message: 'Error verificando' });
   }
 };
 
-// 5. REENVIAR CÓDIGO (Manual)
+// 5. REENVIAR CÓDIGO
 export const resendVerificationCode = async (req: Request, res: Response) => {
   try {
     const { email } = req.body;
-    if (!email) return res.status(400).json({ message: "Falta el email" });
-
-    const user = await User.findOne({ email });
-    if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
-
-    if (user.status !== 'WAITING_CODE') return res.status(400).json({ message: "Cuenta no está en espera de código." });
-
-    // Validación de email antes de reenviar
-    if (!user.email || !user.email.includes('@')) {
-        return res.status(400).json({ message: "Email inválido en base de datos." });
-    }
+    const emailLower = email.toLowerCase().trim();
+    const user = await User.findOne({ email: emailLower });
+    
+    if (!user || user.status !== 'WAITING_CODE') return res.status(400).json({ message: "No se puede enviar código." });
 
     const newCode = Math.floor(100000 + Math.random() * 900000).toString();
     user.verificationCode = newCode;
     await user.save();
+    await sendVerificationEmail(user.email, newCode);
 
-    console.log(`📧 [SISTEMA]: Solicitud manual. Reenviando código a ${user.email}...`); 
-    
-    // ENVÍO DE CÓDIGO
-    const emailSent = await sendVerificationEmail(user.email, newCode);
-
-    if (!emailSent) {
-        console.error("❌ Falló el reenvío del email.");
-        return res.status(500).json({ message: "Error al enviar el correo." });
-    }
-
-    res.json({ message: "Nuevo código enviado a tu correo." });
-
+    res.json({ message: "Nuevo código enviado." });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: "Error al reenviar código" });
+    res.status(500).json({ message: "Error reenviando código" });
   }
 };
 
@@ -226,7 +158,8 @@ export const resendVerificationCode = async (req: Request, res: Response) => {
 export const forgotPassword = async (req: Request, res: Response) => {
     try {
         const { email } = req.body;
-        const user = await User.findOne({ email });
+        const emailLower = email.toLowerCase().trim();
+        const user = await User.findOne({ email: emailLower });
         if (!user) return res.status(404).json({ message: "Email no registrado" });
 
         const resetToken = crypto.randomBytes(20).toString('hex');
@@ -234,21 +167,17 @@ export const forgotPassword = async (req: Request, res: Response) => {
         user.resetPasswordExpires = new Date(Date.now() + 3600000); 
         await user.save();
 
-        console.log(`📧 [SISTEMA]: Enviando token de recuperación a ${email}...`);
         await sendResetPasswordEmail(user.email, resetToken);
-
-        res.json({ message: "Si el correo existe, se ha enviado un token de recuperación." });
-
+        res.json({ message: "Token enviado al correo." });
     } catch (error) {
         res.status(500).json({ message: "Error en forgot password" });
     }
 };
 
-// 7. RESETEAR CONTRASEÑA
+// 7. RESETEAR CONTRASEÑA (Con Token)
 export const resetPassword = async (req: Request, res: Response) => {
     try {
         const { token, newPassword } = req.body;
-
         const user = await User.findOne({ 
             resetPasswordToken: token, 
             resetPasswordExpires: { $gt: Date.now() } 
@@ -256,51 +185,94 @@ export const resetPassword = async (req: Request, res: Response) => {
 
         if (!user) return res.status(400).json({ message: "Token inválido o expirado" });
 
-        user.password = newPassword;
+        user.password = newPassword; // El middleware del modelo hará el hash
         user.resetPasswordToken = undefined;
         user.resetPasswordExpires = undefined;
         
         await user.save();
-
-        res.json({ message: "Contraseña actualizada correctamente." });
-
+        res.json({ message: "Contraseña actualizada." });
     } catch (error) {
         res.status(500).json({ message: "Error reseteando password" });
     }
 };
 
-// 8. PERFIL
+// 8. PERFIL (GET)
 export const getProfile = async (req: any, res: Response) => {
     try {
-        const { id } = req.params;
-        const requester = req.user;
-
-        if (!requester) return res.status(401).json({ message: "No autorizado." });
-
-        if (requester.role !== 'ADMIN' && requester._id.toString() !== id) {
-            return res.status(403).json({ message: "No tienes permiso para ver este perfil." });
-        }
-
-        const user = await User.findById(id);
+        const user = await User.findById(req.user._id);
         if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
-        
         res.json(user);
     } catch (error) {
         res.status(500).json({ message: "Error obteniendo perfil" });
     }
 };
 
-// 9. ACTUALIZAR AVATAR
+// 9. ACTUALIZAR AVATAR (Legacy - Mantenido por compatibilidad)
 export const updateAvatar = async (req: any, res: Response) => {
     try {
-        const userId = req.user._id;
-        const { avatar } = req.body;
-
-        if (!avatar) return res.status(400).json({ message: "Se requiere URL de avatar." });
-
-        const user = await User.findByIdAndUpdate(userId, { avatar }, { new: true });
+        const user = await User.findByIdAndUpdate(req.user._id, { avatar: req.body.avatar }, { new: true });
         res.json({ message: "Avatar actualizado.", user });
+    } catch (error) { res.status(500).json({ message: "Error" }); }
+};
+
+// ==========================================
+// NUEVAS FUNCIONALIDADES PARA PERFIL
+// ==========================================
+
+// 10. ACTUALIZAR PERFIL (Nombre, Alias, Email, Avatar)
+export const updateProfile = async (req: any, res: Response) => {
+    try {
+        const { name, surname, alias, email, avatar } = req.body;
+        const userId = req.user._id;
+
+        // Validar si el alias/email ya existe en OTRO usuario
+        if (alias || email) {
+             const existing = await User.findOne({
+                 $and: [
+                     { _id: { $ne: userId } }, // No soy yo
+                     { $or: [{ alias }, { email: email?.toLowerCase() }] }
+                 ]
+             });
+             if (existing) return res.status(400).json({ message: "Alias o Email ya ocupado por otro usuario." });
+        }
+
+        const updates: any = {};
+        if (name) updates.name = name;
+        if (surname) updates.surname = surname;
+        if (alias) updates.alias = alias;
+        if (email) updates.email = email.toLowerCase().trim();
+        if (avatar) updates.avatar = avatar;
+
+        const updatedUser = await User.findByIdAndUpdate(userId, updates, { new: true });
+
+        res.json({ message: "Perfil actualizado correctamente.", user: updatedUser });
     } catch (error) {
-        res.status(500).json({ message: "Error actualizando avatar" });
+        console.error(error);
+        res.status(500).json({ message: "Error actualizando perfil." });
+    }
+};
+
+// 11. CAMBIAR CONTRASEÑA (Estando logueado)
+export const changePassword = async (req: any, res: Response) => {
+    try {
+        const { currentPassword, newPassword } = req.body;
+        const userId = req.user._id;
+
+        // 1. Obtener usuario con password
+        const user = await User.findById(userId).select('+password');
+        if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
+
+        // 2. Verificar contraseña actual
+        const isMatch = await bcrypt.compare(currentPassword, user.password || '');
+        if (!isMatch) return res.status(400).json({ message: "La contraseña actual es incorrecta." });
+
+        // 3. Guardar nueva (El middleware 'pre save' del modelo User hará el hash automáticamente si se modifica 'password')
+        user.password = newPassword;
+        await user.save();
+
+        res.json({ message: "Contraseña cambiada con éxito." });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: "Error cambiando contraseña." });
     }
 };
