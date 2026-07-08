@@ -13,9 +13,16 @@ import gameRoutes from './routes/gameRoutes.js';
 
 const app: Application = express();
 // 👇 AÑADE ESTO AL PRINCIPIO 👇
+const allowedOrigins = ['http://localhost:5173', 'http://localhost:5174', 'https://api-futbol.vercel.app'];
 app.use(cors({
-    origin: 'http://localhost:5173', // Permite peticiones desde tu frontend
-    credentials: true // Permite cookies/headers de autorización
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
+    credentials: true
 }));
 // Middleware para leer JSON en el body de las peticiones (Login, Registro, etc.)
 app.use(express.json());

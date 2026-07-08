@@ -17,16 +17,26 @@ export const getPendingUsers = async (req: Request, res: Response) => {
 // 2. Crear Juego
 export const createGame = async (req: Request, res: Response) => {
     try {
-        const { name, seasonYear, entryPrice } = req.body;
+        // AÑADIMOS 'rules' AQUÍ 👇
+        const { name, seasonYear, entryPrice, rules } = req.body;
+        
         const season = await Season.findOne({ year: seasonYear });
         if (!season) return res.status(404).json({ message: "Temporada no encontrada" });
 
         const newGame = await Game.create({
-            name, season: season._id, status: 'OPEN', entryPrice, pot: 0, currentRound: 1
+            name, 
+            season: season._id, 
+            status: 'OPEN', 
+            entryPrice, 
+            pot: 0, 
+            currentRound: 1,
+            // AÑADIMOS ESTO PARA QUE GUARDE LAS REGLAS 👇
+            rules: rules || {} // Si no envían reglas, usará los defaults del Modelo (false)
         });
 
         res.status(201).json({ message: "Juego creado", game: newGame });
     } catch (error) {
+        console.error(error); // Agregamos log para ver errores si pasan
         res.status(500).json({ message: "Error creando juego" });
     }
 };
@@ -79,8 +89,13 @@ export const getGameDetails = async (req: Request, res: Response) => {
             .populate('user', 'alias avatar')
             .sort({ isAlive: -1 });
 
-        res.json({ ...game.toObject(), players: players });
-    } catch (error) {
-        res.status(500).json({ message: "Error obteniendo detalles" });
+        // FILTRO DE SEGURIDAD: Evita el error 500 si hay usuarios borrados
+        const activePlayers = players.filter(p => p.user !== null);
+
+        res.json({ ...game.toObject(), players: activePlayers });
+    } catch (error: any) {
+        // Imprimimos el error real para no estar a ciegas
+        console.error("Error en getGameDetails:", error.message);
+        res.status(500).json({ message: "Error obteniendo detalles", error: error.message });
     }
 };

@@ -1,20 +1,33 @@
 import { Request, Response } from 'express';
-import { ScraperService } from '../services/ScraperService.js';
 import Match from '../models/Match.js';
 import Season from '../models/Season.js';
-import '../models/Team.js'; // Importante para el populate
+import Team from '../models/Team.js'; // Necesario para el populate
+import { ScraperService } from '../services/ScraperService.js';
 
+// Instanciamos el servicio una sola vez
 const scraper = new ScraperService();
 
-// Helper: Calcular año de la temporada
+// ==========================================
+//  HELPERS INTERNOS (Lógica Inteligente)
+// ==========================================
+
+/**
+ * Calcula el año de la temporada automáticamente.
+ * Si estamos en Julio (Mes 6) o más, es el año siguiente.
+ */
 const getAutoSeasonYear = (): string => {
     const now = new Date();
-    const currentMonth = now.getMonth(); 
+    const currentMonth = now.getMonth(); // 0 = Enero, 11 = Diciembre
+    // Si estamos en la segunda mitad del año (Julio en adelante), la temporada es "2026" (aunque estemos en 2025)
+    // Ajusta esto según cómo guardes tus temporadas (2025 o 2026)
     if (currentMonth >= 6) return (now.getFullYear() + 1).toString();
     return now.getFullYear().toString();
 };
 
-// --- HELPER EXPORTADO (LÓGICA COMBINADA ROBUSTA) ---
+/**
+ * LÓGICA MAESTRA: Adivinar la jornada actual.
+ * Soluciona el problema de los partidos aplazados (J16 apareciendo cuando estamos en J24).
+ */
 export const getActiveRoundNumber = async (): Promise<number> => {
     const autoSeason = getAutoSeasonYear();
     const seasonDoc = await Season.findOne({ year: autoSeason });
@@ -22,161 +35,254 @@ export const getActiveRoundNumber = async (): Promise<number> => {
     if (!seasonDoc) return 1;
 
     const now = new Date();
-    // Margen de seguridad: 6 horas atrás para incluir partidos que estén LIVE ahora mismo
-    const bufferDate = new Date(now.getTime() - 6 * 60 * 60 * 1000);
+    // Buffer: Incluimos partidos que empezaron hace 4 horas (por si están LIVE terminando)
+    const bufferDate = new Date(now.getTime() - 4 * 60 * 60 * 1000);
 
-    // 1. Buscamos partidos PENDIENTES o EN JUEGO que sean FUTUROS o RECIENTES
+    // 1. Buscamos los próximos 10 partidos (SCHEDULED o LIVE)
     const nextMatches = await Match.find({
         season: seasonDoc._id,
         status: { $in: ['SCHEDULED', 'LIVE'] }, 
-        matchDate: { 
-            $exists: true, 
-            $gte: bufferDate // <--- FILTRO CLAVE: Ignora la J1 de agosto
-        }
+        matchDate: { $gte: bufferDate }
     })
-    .sort({ matchDate: 1 }) // Ordenamos por fecha (aparecerá primero J19 del 2-dic)
-    .limit(30) // Tomamos un lote grande (3 jornadas aprox) para analizar el contexto
-    .select('round');
+    .sort({ matchDate: 1 }) // Los más cercanos primero
+    .limit(10); // Analizamos una muestra de 10 partidos
 
     if (nextMatches.length > 0) {
-        // 2. "Voto democrático": De los próximos partidos reales, ¿cuál es la jornada más baja?
-        // Esto detectará que aunque la J19 es mañana, la J15 también está en la lista pendiente.
-        const rounds = nextMatches.map(m => m.round);
-        return Math.min(...rounds); // Devolverá 15
+        // TRUCO: Contamos qué jornada se repite más en los próximos partidos.
+        // Si hay un partido suelto de la J16 y ocho de la J24, ganará la J24.
+        const roundCounts: { [key: number]: number } = {};
+        
+        nextMatches.forEach(m => {
+            roundCounts[m.round] = (roundCounts[m.round] || 0) + 1;
+        });
+
+        // Encontramos la jornada con más apariciones
+        let bestRound = nextMatches[0].round;
+        let maxCount = 0;
+
+        for (const [round, count] of Object.entries(roundCounts)) {
+            if (count > maxCount) {
+                maxCount = count;
+                bestRound = Number(round);
+            }
+        }
+        
+        return bestRound;
     }
 
-    // 3. Si no hay partidos futuros (fin de temporada), devolvemos la última jugada
+    // 2. Si no hay partidos futuros (Fin de temporada o parón largo), devolvemos la última jugada.
     const lastMatch = await Match.findOne({
         season: seasonDoc._id,
         status: 'FINISHED'
-    }).sort({ matchDate: -1 }).select('round');
+    }).sort({ matchDate: -1 });
 
     return lastMatch ? lastMatch.round : 1;
 };
 
-// --- CONTROLADORES ---
 
+// ==========================================
+//  MÉTODOS PÚBLICOS (API Frontend)
+// ==========================================
+
+/**
+ * Obtener la jornada actual calculada
+ * GET /api/matches/current-round
+ */
+export const getCurrentRound = async (req: Request, res: Response) => {
+    try {
+        // Usamos la lógica inteligente
+        const round = await getActiveRoundNumber();
+        const autoSeason = getAutoSeasonYear();
+        
+        const seasonDoc = await Season.findOne({ year: autoSeason });
+        if (!seasonDoc) return res.status(404).json({ message: "Temporada no encontrada" });
+
+        // Buscamos los partidos de esa jornada ganadora
+        const matches = await Match.find({ 
+            season: seasonDoc._id, 
+            round: round 
+        })
+        .populate('homeTeam', 'name slug badge logo stadium')
+        .populate('awayTeam', 'name slug badge logo stadium')
+        .sort({ matchDate: 1 });
+
+        // Determinamos el estado global de la jornada para el frontend
+        const isLive = matches.some(m => m.status === 'LIVE');
+        const isScheduled = matches.some(m => m.status === 'SCHEDULED');
+        const status = isLive ? 'LIVE' : (isScheduled ? 'SCHEDULED' : 'FINISHED');
+
+        res.json({
+            season: autoSeason,
+            currentRound: round,
+            status,
+            matches
+        });
+    } catch (error) {
+        console.error("Error en getCurrentRound:", error);
+        res.status(500).json({ error: "Error calculando jornada actual" });
+    }
+};
+
+/**
+ * Obtener partidos con filtros
+ * GET /api/matches?round=22&season=2026
+ */
 export const getMatches = async (req: Request, res: Response) => {
   try {
-    const { season, round } = req.query;
-    const query: any = {};
-    
+    const { round, season, team, status } = req.query;
+    const filter: any = {};
+
     if (season) {
-        const seasonDoc = await Season.findOne({ year: season });
-        if (seasonDoc) query.season = seasonDoc._id;
-        else return res.json([]); 
+      const seasonDoc = await Season.findOne({ year: String(season) });
+      if (seasonDoc) filter.season = seasonDoc._id;
     }
-    if (round) query.round = round;
 
-    const matches = await Match.find(query).sort({ round: 1 }).populate('homeTeam awayTeam season');
-    res.json(matches);
-  } catch (error) { res.status(500).json({ message: 'Error' }); }
-};
-
-export const getMatchById = async (req: Request, res: Response) => {
-    const { id } = req.params;
-    try {
-      const match = await Match.findById(id).populate('homeTeam awayTeam season');
-      if (!match) return res.status(404).json({ message: 'Partido no encontrado' });
-      res.json(match);
-    } catch (error) { res.status(500).json({ message: 'Error' }); }
-};
-
-export const getMatchesByRound = async (req: Request, res: Response) => {
-    const { season, round } = req.params;
-    try {
-        const seasonDoc = await Season.findOne({ year: season });
-        if (!seasonDoc) return res.status(404).json({ message: 'Temporada no encontrada' });
-        const matches = await Match.find({ season: seasonDoc._id, round: parseInt(round) }).populate('homeTeam awayTeam season');
-        res.json(matches);
-    } catch (error) { res.status(500).json({ message: 'Error' }); }
-};
-
-// ENDPOINT PRINCIPAL DEL DASHBOARD (Jornada Actual)
-export const getCurrentRound = async (req: Request, res: Response) => {
-  try {
-    const seasonYear = req.query.season ? String(req.query.season) : getAutoSeasonYear();
-    const seasonDoc = await Season.findOne({ year: seasonYear });
+    if (round) filter.round = Number(round);
+    if (status) filter.status = String(status);
     
-    if (!seasonDoc) return res.status(404).json({ message: "Temporada no iniciada", currentRound: 1, matches: [] });
+    if (team) {
+       filter.$or = [{ homeTeam: team }, { awayTeam: team }];
+    }
 
-    // Usamos el helper corregido
-    const targetRound = await getActiveRoundNumber();
+    const matches = await Match.find(filter)
+      .populate('homeTeam', 'name slug badge logo stadium')
+      .populate('awayTeam', 'name slug badge logo stadium')
+      .sort({ matchDate: 1 });
 
-    const matches = await Match.find({
-        season: seasonDoc._id,
-        round: targetRound
-    })
-    .sort({ matchDate: 1 })
-    .populate('homeTeam')
-    .populate('awayTeam');
-
-    // Calculamos estado global visual
-    const activeMatches = matches.filter(m => m.status === 'LIVE').length;
-    const scheduledMatches = matches.filter(m => m.status === 'SCHEDULED').length;
-    let status = 'FINISHED';
-    if (activeMatches > 0) status = 'LIVE';
-    else if (scheduledMatches > 0) status = 'SCHEDULED';
-
-    res.json({ 
-        season: seasonYear, 
-        currentRound: targetRound, 
-        status: status, 
-        matches: matches 
+    res.json({
+      success: true,
+      count: matches.length,
+      data: matches
     });
 
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Error calculando jornada', currentRound: 0, matches: [] });
+    res.status(500).json({ success: false, error: 'Error al obtener partidos' });
   }
 };
 
-// --- MANTENIMIENTO ---
-
-export const seedSeason = async (req: Request, res: Response) => {
-    const { season } = req.params;
-    if (!season) return res.status(400).send("Falta season");
-    res.send(`🚀 Seed iniciado para ${season}.`);
-    scraper.scrapeFullSeason(season).catch(err => console.error(err));
-};
-
-export const hydrateRound = async (req: Request, res: Response) => {
-  const { season, round } = req.params;
+/**
+ * Obtener un solo partido por ID
+ * GET /api/matches/:id
+ */
+export const getMatchById = async (req: Request, res: Response) => {
   try {
-    const roundNumber = parseInt(round);
-    const seasonDoc = await Season.findOne({ year: season });
-    if (!seasonDoc) return res.status(404).send("Temporada no encontrada");
-    const matches = await Match.find({ season: seasonDoc._id, round: roundNumber }).populate('homeTeam awayTeam');
-    if (matches.length === 0) return res.status(404).send("No hay partidos.");
+    const { id } = req.params;
+    const match = await Match.findById(id)
+      .populate('homeTeam')
+      .populate('awayTeam')
+      .populate('season');
+      
+    if (!match) return res.status(404).json({ success: false, error: 'Partido no encontrado' });
+    
+    res.json({ success: true, data: match });
 
-    res.send(`🚀 Hidratando J${round}.`);
-    (async () => {
-        // --- LOG DE INICIO AGREGADO ---
-        console.log(`🚀 [MANUAL] Iniciando hidratación de la Jornada ${roundNumber}...`);
-        
-        for (const match of matches) {
-            await scraper.scrapeMatchDetail(match.matchUrl);
-            await new Promise(r => setTimeout(r, 2000));
-        }
-
-        // --- LOG DE FINALIZACIÓN AGREGADO ---
-        console.log(`✅ [MANUAL] Hidratación de la Jornada ${roundNumber} completada.`);
-    })();
-  } catch (error) { if (!res.headersSent) res.status(500).send("Error"); }
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Error interno del servidor' });
+  }
 };
 
+/**
+ * Obtener partidos de una jornada específica
+ * GET /api/matches/:season/:round
+ */
+export const getMatchesByRound = async (req: Request, res: Response) => {
+    try {
+        const { season, round } = req.params;
+
+        const seasonDoc = await Season.findOne({ year: season });
+        if (!seasonDoc) return res.status(404).json({ error: "Temporada no encontrada" });
+
+        const matches = await Match.find({ 
+            season: seasonDoc._id, 
+            round: Number(round) 
+        })
+        .populate('homeTeam', 'name slug badge logo')
+        .populate('awayTeam', 'name slug badge logo')
+        .sort({ matchDate: 1 });
+
+        res.json({ success: true, count: matches.length, data: matches });
+
+    } catch (error) {
+        res.status(500).json({ error: "Error obteniendo la jornada" });
+    }
+};
+
+// ==========================================
+//  MÉTODOS ADMIN (Mantenimiento)
+// ==========================================
+
+/**
+ * Hidratar una jornada completa (Arreglar fechas y resultados)
+ * GET /api/hydrate-round/:season/:round
+ */
+export const hydrateRound = async (req: Request, res: Response) => {
+    try {
+        const { season, round } = req.params;
+        
+        console.log(`🚀 [ADMIN] Iniciando hidratación manual de Jornada ${round} - Temp ${season}...`);
+        
+        // Llamada asíncrona al scraper (no bloqueamos la respuesta HTTP)
+        scraper.scrapeRound(String(season), Number(round));
+
+        res.json({ 
+            success: true,
+            message: `Proceso de scraping iniciado para Jornada ${round}. Revisa la consola.`
+        });
+
+    } catch (error) {
+        console.error("❌ Error en hydrateRound:", error);
+        res.status(500).json({ success: false, error: 'Error al hidratar' });
+    }
+};
+
+/**
+ * Inicializar una temporada
+ * GET /api/seed/:season
+ */
+export const seedSeason = async (req: Request, res: Response) => {
+    try {
+        const { season } = req.params;
+        console.log(`🌱 [ADMIN] Sembrando temporada ${season}...`);
+
+        let seasonDoc = await Season.findOne({ year: season });
+        if (!seasonDoc) {
+            seasonDoc = await Season.create({ 
+                year: season, 
+                name: `Temporada ${season}/${Number(season)+1}` 
+            });
+            console.log("✅ Temporada creada en BD.");
+        }
+        
+        res.json({ success: true, message: `Temporada ${season} lista.`, seasonId: seasonDoc._id });
+
+    } catch (error) {
+        res.status(500).json({ error: 'Error al sembrar temporada' });
+    }
+};
+
+/**
+ * Sincronizar Estadios
+ * GET /api/sync-stadiums
+ */
 export const syncStadiums = async (req: Request, res: Response) => {
     try {
-      const matchesWithStadium = await Match.find({ stadium: { $ne: null, $exists: true } });
-      if (matchesWithStadium.length === 0) return res.send("No hay datos.");
-      res.send(`🔄 Sincronizando...`);
-      (async () => {
-          for (const match of matchesWithStadium) {
-              if (match.homeTeam && match.stadium) {
-                  const TeamModel = (await import('../models/Team.js')).default;
-                  await TeamModel.findByIdAndUpdate(match.homeTeam, { stadium: match.stadium });
-              }
-          }
-      })();
-    } catch (error) { if (!res.headersSent) res.status(500).send("Error"); }
+        console.log("🏟️ [ADMIN] Sincronizando estadios...");
+        
+        const matches = await Match.find({ stadium: null }).populate('homeTeam');
+        let updatedCount = 0;
+
+        for (const match of matches) {
+            const homeTeam = match.homeTeam as any; 
+            if (homeTeam && homeTeam.stadium) {
+                match.stadium = homeTeam.stadium;
+                await match.save();
+                updatedCount++;
+            }
+        }
+
+        res.json({ success: true, updated: updatedCount });
+
+    } catch (error) {
+        res.status(500).json({ error: 'Error sincronizando estadios' });
+    }
 };
